@@ -5,6 +5,9 @@ import torch
 from torch import Tensor
 from transformers import PreTrainedTokenizer, PreTrainedModel
 from math import sqrt
+from pathlib import Path
+from datetime import datetime
+import json
 
 OperatorType = Literal["AND", "OR", "NOT", "VAR"]
 
@@ -77,6 +80,16 @@ class BooleanFormula:
 
         raise ValueError(f"Unknown operator: {self.operator}")
 
+    def to_dict(self) -> dict:
+        """Convert formula to a dictionary for JSON serialization."""
+        if self.operator == "VAR":
+            return {"operator": self.operator, "operands": self.operands}
+        else:
+            return {
+                "operator": self.operator,
+                "operands": [op.to_dict() for op in self.operands]
+            }
+
 
 def generate_random_formula(num_vars: int, max_depth: int) -> BooleanFormula:
     """
@@ -127,18 +140,6 @@ def generate_all_assignments(num_vars: int) -> List[Dict[str, bool]]:
             assignment[f"x{j}"] = bool((i >> j) & 1)
         assignments.append(assignment)
     return assignments
-
-
-@dataclass
-class Observation:
-    result: bool  # Formula evaluation result
-    reward: float  # Could be based on prediction accuracy
-
-
-@dataclass
-class Step:
-    action: Dict[str, bool]  # Variable assignment
-    observation: Observation
 
 
 @dataclass
@@ -197,7 +198,7 @@ def model_policy(
 
 
 # Add new type alias for reward functions
-RewardType = Callable[[Trajectory], float]
+RewardFunction = Callable[[Trajectory], List[float]]
 
 
 def constant_reward(_: Trajectory) -> float:
@@ -205,13 +206,43 @@ def constant_reward(_: Trajectory) -> float:
     return 1.0
 
 
-def model_reward(model: PreTrainedModel, tokenizer: PreTrainedTokenizer) -> RewardType:
-    """Creates a reward function using the language model's prediction probability."""
-
-    def reward(trajectory: Trajectory) -> float:
-        return calculate_prediction_reward(model, tokenizer, trajectory).item()
-
-    return reward
+def model_reward(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizer,
+) -> RewardFunction:
+    """
+    Create reward function that calculates reward based on model's prediction accuracy.
+    Returns probability of correct result at each step.
+    """
+    def reward_fn(trajectory: Trajectory) -> List[float]:
+        # Format full trajectory
+        input_text = format_trajectory_prompt(trajectory)
+        tokens = tokenizer.encode(input_text)
+        input_ids = torch.tensor(tokens).unsqueeze(0)
+        
+        # Get model predictions
+        with torch.no_grad():
+            outputs = model(input_ids=input_ids)
+            logits = outputs.logits
+        
+        # Find all '->' positions
+        arrow_positions = [i for i, t in enumerate(tokens) if t == 4613]
+        
+        # Calculate reward for each step
+        rewards = []
+        true_token = tokenizer.encode(" True")[0]
+        false_token = tokenizer.encode(" False")[0]
+        
+        for pos, result in zip(arrow_positions, trajectory.observations):
+            next_token_logits = logits[0, pos]
+            true_false_logits = next_token_logits[[true_token, false_token]]
+            probs = torch.softmax(true_false_logits, dim=0)
+            # Use the probability of the correct prediction
+            prob_correct = probs[0] if result else probs[1]
+            rewards.append(prob_correct.item())
+        
+        return rewards
+    return reward_fn
 
 
 def generate_trajectory(
@@ -256,47 +287,6 @@ def generate_trajectory(
             break
             
     return Trajectory(observations=observations, actions=actions, rewards=None)
-
-
-def calculate_trajectory_rewards(
-    model: PreTrainedModel,
-    tokenizer: PreTrainedTokenizer,
-    trajectory: Trajectory,
-) -> List[float]:
-    """
-    Calculate rewards for entire trajectory at once.
-    
-    Args:
-        model: Language model to use for predictions
-        tokenizer: Tokenizer for the model
-        trajectory: Trajectory to calculate rewards for
-        
-    Returns:
-        List of rewards (log probabilities of correct results)
-    """
-    # Format full trajectory
-    input_text = format_trajectory_prompt(trajectory)
-    tokens = tokenizer.encode(input_text)
-    input_ids = torch.tensor(tokens).unsqueeze(0)
-    
-    # Get model predictions
-    with torch.no_grad():
-        outputs = model(input_ids=input_ids)
-        logits = outputs.logits
-    
-    # Find all '->' positions
-    arrow_positions = [i for i, t in enumerate(tokens) if t == 4613]
-    
-    # Calculate reward for each step
-    rewards = []
-    for pos, result in zip(arrow_positions, trajectory.observations):
-        next_token_logits = logits[0, pos]
-        true_false_logits = next_token_logits[[tokenizer.encode(" True")[0], 
-                                             tokenizer.encode(" False")[0]]]
-        prob_correct = torch.softmax(true_false_logits, dim=0)[int(not result)]
-        rewards.append(torch.log(prob_correct).item())
-    
-    return rewards
 
 
 def format_trajectory_prompt(trajectory: Trajectory) -> str:
@@ -451,100 +441,6 @@ def get_model_action(
     )
 
 
-def calculate_prediction_reward(
-    model: PreTrainedModel,
-    tokenizer: PreTrainedTokenizer,
-    trajectory: Trajectory,
-) -> Tensor:
-    """
-    Calculate the reward (log probability) that the model assigns to the final True/False
-    token in the complete trajectory.
-
-    Args:
-        model: Language model to use
-        tokenizer: Tokenizer for the model
-        trajectory: Complete trajectory including final observation
-
-    Returns:
-        Reward tensor (log probability of correct final token)
-    """
-    if len(trajectory.steps) == 0:
-        return torch.tensor(0.0)  # No reward for empty trajectory
-
-    # Format the complete trajectory as input
-    input_text = format_trajectory_prompt(trajectory)
-    input_ids = torch.tensor(tokenizer.encode(input_text)).unsqueeze(0)
-
-    with torch.no_grad():
-        outputs = model(input_ids)
-        logits = outputs.logits[:, -2, :]  # Get logits for final True/False token
-        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-
-        # Get the actual token that was used (True or False)
-        final_result = trajectory.steps[-1].observation.result
-        target_token = tokenizer.encode(f" {final_result}")[0]
-        reward = log_probs[0, target_token]
-
-    return reward
-
-
-@dataclass
-class TrajectoryStats:
-    """Statistics about trajectory rewards"""
-
-    mean: float
-    std: float
-    count: int
-
-
-class ExpertIterationTrainer:
-    def __init__(
-        self,
-        actor_model: PreTrainedModel,
-        critic_model: PreTrainedModel,
-        tokenizer: PreTrainedTokenizer,
-        num_vars: int,
-    ):
-        self.actor_model = actor_model
-        self.critic_model = critic_model
-        self.tokenizer = tokenizer
-        self.num_vars = num_vars
-        self.stats = RunningStats()
-        self.optimizer = torch.optim.Adam(actor_model.parameters())
-        self.reward_fn = model_reward(critic_model, tokenizer)
-
-    def update_stats(self, reward: float):
-        """Update running statistics with new reward."""
-        self.stats.update(reward)
-
-    def generate_and_train(
-        self, formula: BooleanFormula, max_steps: Optional[int] = None
-    ) -> Trajectory:
-        """Generate trajectory and potentially train on it."""
-        # Create policy
-        policy = model_policy(self.actor_model, self.tokenizer, self.num_vars)
-        
-        # Generate trajectory
-        trajectory = generate_trajectory(formula, policy, max_steps)
-        
-        # Calculate rewards
-        rewards = self.reward_fn(trajectory)
-        trajectory.rewards = rewards
-        
-        # Calculate average reward
-        avg_reward = sum(rewards) / len(rewards)
-        
-        # Update statistics
-        previous_mean, previous_std = self.stats.mean, self.stats.std
-        self.update_stats(avg_reward)
-        
-        # Train if trajectory is good enough
-        if avg_reward >= previous_mean + previous_std:
-            self.train_on_trajectory(trajectory)
-            
-        return trajectory
-
-
 def calculate_assignment_loss(
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizer,
@@ -580,54 +476,12 @@ def calculate_assignment_loss(
     return outputs.loss
 
 
-RewardFunction = Callable[[Trajectory], List[float]]
-
-def constant_reward() -> RewardFunction:
-    """Create reward function that returns constant reward for each step."""
-    def reward_fn(trajectory: Trajectory) -> List[float]:
-        return [0.0] * len(trajectory.observations)
-    return reward_fn
-
-def model_reward(
-    model: PreTrainedModel,
-    tokenizer: PreTrainedTokenizer,
-) -> RewardFunction:
-    """
-    Create reward function that calculates reward based on model's prediction accuracy.
-    Returns log probability of correct result at each step.
-    """
-    def reward_fn(trajectory: Trajectory) -> List[float]:
-        # Format full trajectory
-        input_text = format_trajectory_prompt(trajectory)
-        tokens = tokenizer.encode(input_text)
-        input_ids = torch.tensor(tokens).unsqueeze(0)
-        
-        # Get model predictions
-        with torch.no_grad():
-            outputs = model(input_ids=input_ids)
-            logits = outputs.logits
-        
-        # Find all '->' positions
-        arrow_positions = [i for i, t in enumerate(tokens) if t == 4613]
-        
-        # Calculate reward for each step
-        rewards = []
-        for pos, result in zip(arrow_positions, trajectory.observations):
-            next_token_logits = logits[0, pos]
-            true_false_logits = next_token_logits[[tokenizer.encode(" True")[0], 
-                                                 tokenizer.encode(" False")[0]]]
-            prob_correct = torch.softmax(true_false_logits, dim=0)[int(not result)]
-            rewards.append(torch.log(prob_correct).item())
-        
-        return rewards
-    return reward_fn
-
 class RunningStats:
     """Keep track of mean and standard deviation in an online manner."""
     def __init__(self):
-        self.n = 0
-        self.mean = 0.0
-        self.M2 = 0.0
+        self.n = 1  # Start with n=1 to avoid division by zero
+        self.mean = 0.5  # Default mean for probabilities
+        self.M2 = 0.0833  # Variance of uniform distribution on [0,1]
         
     def update(self, x: float):
         self.n += 1
@@ -639,5 +493,86 @@ class RunningStats:
     @property
     def std(self) -> float:
         if self.n < 2:
-            return float('inf')
-        return (self.M2 / (self.n - 1)) ** 0.5
+            return sqrt(0.0833)  # std of uniform distribution on [0,1]
+        return sqrt(self.M2 / (self.n - 1))
+
+
+class ExpertIterationTrainer:
+    def __init__(
+        self,
+        actor_model: PreTrainedModel,
+        critic_model: PreTrainedModel,
+        tokenizer: PreTrainedTokenizer,
+        num_vars: int,
+    ):
+        self.actor_model = actor_model
+        self.critic_model = critic_model
+        
+        # Disable gradients for critic model
+        for param in self.critic_model.parameters():
+            param.requires_grad = False
+            
+        self.tokenizer = tokenizer
+        self.num_vars = num_vars
+        self.stats = RunningStats()
+        self.optimizer = torch.optim.Adam(self.actor_model.parameters())
+        self.reward_fn = model_reward(self.critic_model, self.tokenizer)
+
+    def update_stats(self, reward: float):
+        """Update running statistics with new reward."""
+        self.stats.update(reward)
+
+    def train_on_trajectory(self, trajectory: Trajectory) -> None:
+        """Train the actor model on a trajectory."""
+        self.optimizer.zero_grad()
+        loss = self.calculate_loss(trajectory)
+        loss.backward()
+        self.optimizer.step()
+
+    def calculate_loss(self, trajectory: Trajectory) -> torch.Tensor:
+        """Calculate loss for a trajectory without performing optimization."""
+        return calculate_assignment_loss(self.actor_model, self.tokenizer, trajectory)
+
+    def generate_and_train(
+        self, formula: BooleanFormula, max_steps: Optional[int] = None
+    ) -> Trajectory:
+        """Generate trajectory and potentially train on it."""
+        # Create policy
+        policy = model_policy(self.actor_model, self.tokenizer, self.num_vars)
+        
+        # Generate trajectory
+        trajectory = generate_trajectory(formula, policy, max_steps)
+        
+        # Calculate rewards
+        rewards = self.reward_fn(trajectory)
+        trajectory.rewards = rewards
+        
+        # Calculate average reward
+        avg_reward = sum(rewards) / len(rewards)
+        
+        # Update statistics
+        previous_mean, previous_std = self.stats.mean, self.stats.std
+        self.update_stats(avg_reward)
+        
+        # Train if trajectory is good enough
+        if avg_reward >= previous_mean + previous_std:
+            self.train_on_trajectory(trajectory)
+            
+        return trajectory
+
+
+def log_trajectory(log_file: Path, trajectory: Trajectory, loss: Optional[float], formula: BooleanFormula):
+    """Log trajectory data to jsonl file."""
+    data = {
+        'timestamp': datetime.now().isoformat(),
+        'formula': formula.to_dict(),
+        'trajectory': {
+            'actions': trajectory.actions,
+            'observations': trajectory.observations,
+            'rewards': trajectory.rewards
+        },
+        'loss': loss
+    }
+    with open(log_file, 'a') as f:
+        json.dump(data, f)
+        f.write('\n')

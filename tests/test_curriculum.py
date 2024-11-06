@@ -166,7 +166,7 @@ def test_reward_functions():
     model_rewards = model_reward_fn(trajectory)
     assert len(model_rewards) == len(trajectory.observations)
     assert all(isinstance(r, float) for r in model_rewards)
-    assert all(r <= 0.0 for r in model_rewards)  # Log probabilities should be non-positive
+    assert all(0.0 <= r <= 1.0 for r in model_rewards)  # Probabilities should be between 0 and 1
 
 
 def test_loss_invariant_to_result_formatting():
@@ -391,3 +391,67 @@ def test_tokenization_patterns_complex():
         # Equals should be properly spaced (for variable assignments)
         assert step_equals[1] > step_equals[0] + 1
         assert step_equals[2] > step_equals[1] + 1
+
+def test_rewards_sensitive_to_results():
+    """Test that rewards change when results change but only for the modified step."""
+    model = AutoModelForCausalLM.from_pretrained("gpt2")
+    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    reward_fn = model_reward(model, tokenizer)
+    
+    formula = BooleanFormula(
+        "AND",
+        [
+            BooleanFormula("VAR", "x0"),
+            BooleanFormula("NOT", [BooleanFormula("VAR", "x1")]),
+        ],
+    )
+    
+    base_trajectory = generate_trajectory(
+        formula, 
+        enumerative_policy(num_vars=2), 
+        max_steps=2
+    )
+    base_rewards = reward_fn(base_trajectory)
+    
+    # Modify last result
+    modified_trajectory = deepcopy(base_trajectory)
+    modified_trajectory.observations[-1] = not modified_trajectory.observations[-1]
+    modified_rewards = reward_fn(modified_trajectory)
+    
+    # Check that only the last reward changed
+    assert len(modified_rewards) == len(base_rewards)
+    assert all(mr == br for mr, br in zip(modified_rewards[:-1], base_rewards[:-1])), \
+        "Earlier rewards shouldn't change when modifying last result"
+    assert abs(modified_rewards[-1] - base_rewards[-1]) > 1e-5, \
+        "Last reward should change when modifying last result"
+
+def test_rewards_invariant_to_formatting():
+    """Test that rewards are invariant to formatting changes after the result."""
+    model = AutoModelForCausalLM.from_pretrained("gpt2")
+    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    reward_fn = model_reward(model, tokenizer)
+    
+    formula = BooleanFormula(
+        "AND",
+        [
+            BooleanFormula("VAR", "x0"),
+            BooleanFormula("NOT", [BooleanFormula("VAR", "x1")]),
+        ],
+    )
+    
+    base_trajectory = generate_trajectory(
+        formula, 
+        enumerative_policy(num_vars=2), 
+        max_steps=2
+    )
+    base_rewards = reward_fn(base_trajectory)
+    
+    # Add an extra observation without changing results
+    modified_trajectory = deepcopy(base_trajectory)
+    modified_trajectory.actions.append({"x0": True, "x1": True})  # Add action without observation
+    modified_rewards = reward_fn(modified_trajectory)
+    
+    # Check that rewards are unchanged
+    assert len(modified_rewards) == len(base_rewards)
+    assert all(abs(mr - br) < 1e-5 for mr, br in zip(modified_rewards, base_rewards)), \
+        "Rewards shouldn't change when adding incomplete steps"
