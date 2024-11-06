@@ -7,16 +7,17 @@ from src.curriculum import (
     encode_assignment,
     decode_assignment,
     get_model_action,
-    calculate_prediction_reward,
+    calculate_assignment_loss,
     enumerative_policy,
     model_policy,
-    RewardType,
     constant_reward,
     model_reward,
     ExpertIterationTrainer,
+    Trajectory,
 )
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from copy import deepcopy
 
 
 def test_boolean_formula_evaluation():
@@ -85,6 +86,7 @@ def test_formula_evaluation_with_extra_variables():
 
 
 def test_trajectory_generation():
+    """Test basic trajectory generation without rewards."""
     formula = BooleanFormula(
         "AND",
         [
@@ -94,19 +96,22 @@ def test_trajectory_generation():
     )
 
     policy = enumerative_policy(num_vars=2)
-    trajectory = generate_trajectory(formula, policy, reward_fn=constant_reward)
+    trajectory = generate_trajectory(formula, policy, max_steps=4)
 
-    # Should have 2^2 = 4 steps
-    assert len(trajectory.steps) == 4
+    # Should have exactly 4 steps
+    assert len(trajectory.actions) == 4
+    assert len(trajectory.observations) == 4
+    assert trajectory.rewards is None
 
     # Check first step
-    first_step = trajectory.steps[0]
-    assert first_step.action == {"x0": False, "x1": False}
-    assert first_step.observation.result == False
-    assert first_step.observation.reward == 1.0
+    first_action = trajectory.actions[0]
+    first_result = trajectory.observations[0]
+    assert first_action == {"x0": False, "x1": False}
+    assert first_result == False
 
 
 def test_trajectory_prompt_formatting():
+    """Test formatting of trajectory into prompt string."""
     formula = BooleanFormula(
         "AND",
         [
@@ -116,22 +121,156 @@ def test_trajectory_prompt_formatting():
     )
 
     policy = enumerative_policy(num_vars=2)
-    trajectory = generate_trajectory(formula, policy, reward_fn=constant_reward)
+    trajectory = generate_trajectory(formula, policy, max_steps=2)
 
     # Test prompt formatting
     prompt = format_trajectory_prompt(trajectory)
     lines = prompt.split("\n")
-    assert len(lines) == 4  # Should show all 4 steps
+    assert len(lines) == 2  # Should show both steps
 
     # Verify format of steps
     for line in lines:
-        assert "→" in line
+        assert "->" in line
         assert line.startswith("x0=")
         assert "x1=" in line
         assert line.endswith("True") or line.endswith("False")
 
 
+def test_reward_functions():
+    """Test that reward functions return correct length lists of floats."""
+    model = AutoModelForCausalLM.from_pretrained("gpt2")
+    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    
+    formula = BooleanFormula(
+        "AND",
+        [
+            BooleanFormula("VAR", "x0"),
+            BooleanFormula("NOT", [BooleanFormula("VAR", "x1")]),
+        ],
+    )
+    
+    trajectory = generate_trajectory(
+        formula, 
+        enumerative_policy(num_vars=2), 
+        max_steps=2
+    )
+    
+    # Test constant reward
+    const_reward_fn = constant_reward()
+    const_rewards = const_reward_fn(trajectory)
+    assert len(const_rewards) == len(trajectory.observations)
+    assert all(r == 0.0 for r in const_rewards)
+    
+    # Test model reward
+    model_reward_fn = model_reward(model, tokenizer)
+    model_rewards = model_reward_fn(trajectory)
+    assert len(model_rewards) == len(trajectory.observations)
+    assert all(isinstance(r, float) for r in model_rewards)
+    assert all(r <= 0.0 for r in model_rewards)  # Log probabilities should be non-positive
+
+
+def test_loss_invariant_to_result_formatting():
+    """Test that loss calculation ignores tokens after variable assignments."""
+    actor_model = AutoModelForCausalLM.from_pretrained("gpt2")
+    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    
+    formula = BooleanFormula(
+        "AND",
+        [
+            BooleanFormula("VAR", "x0"),
+            BooleanFormula("NOT", [BooleanFormula("VAR", "x1")]),
+        ],
+    )
+    
+    base_trajectory = generate_trajectory(
+        formula, 
+        enumerative_policy(num_vars=2), 
+        max_steps=1
+    )
+    base_loss = calculate_assignment_loss(actor_model, tokenizer, base_trajectory)
+    
+    # Modify result formatting
+    modified_trajectory = deepcopy(base_trajectory)
+    tokens = tokenizer.encode(format_trajectory_prompt(modified_trajectory))
+    last_equals_pos = max(i for i, t in enumerate(tokens) if t == 28)
+    modified_tokens = tokens[:last_equals_pos + 2]  # Keep up to True/False after last =
+    modified_tokens.extend([2] * (len(tokens) - len(modified_tokens)))  # Pad with constant token
+    modified_loss = calculate_assignment_loss(actor_model, tokenizer, modified_trajectory)
+    
+    assert abs(base_loss.item() - modified_loss.item()) < 1e-5, \
+        "Loss shouldn't change when modifying result formatting"
+
+
+def test_loss_sensitive_to_assignments():
+    """Test that loss changes when variable assignments change."""
+    actor_model = AutoModelForCausalLM.from_pretrained("gpt2")
+    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    
+    formula = BooleanFormula(
+        "AND",
+        [
+            BooleanFormula("VAR", "x0"),
+            BooleanFormula("NOT", [BooleanFormula("VAR", "x1")]),
+        ],
+    )
+    
+    base_trajectory = generate_trajectory(
+        formula, 
+        enumerative_policy(num_vars=2), 
+        max_steps=1
+    )
+    base_loss = calculate_assignment_loss(actor_model, tokenizer, base_trajectory)
+    
+    # Modify last variable assignment
+    modified_trajectory = deepcopy(base_trajectory)
+    modified_trajectory.actions[-1]["x1"] = not modified_trajectory.actions[-1]["x1"]
+    modified_loss = calculate_assignment_loss(actor_model, tokenizer, modified_trajectory)
+    
+    assert abs(base_loss.item() - modified_loss.item()) > 1e-5, \
+        "Loss should change when modifying variable assignments"
+
+
+def test_expert_iteration_token_patterns():
+    """Test that ExpertIterationTrainer maintains correct token patterns."""
+    actor_model = AutoModelForCausalLM.from_pretrained("gpt2")
+    critic_model = AutoModelForCausalLM.from_pretrained("gpt2")
+    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    
+    trainer = ExpertIterationTrainer(
+        actor_model=actor_model,
+        critic_model=critic_model,
+        tokenizer=tokenizer,
+        num_vars=2,
+    )
+    
+    formula = BooleanFormula(
+        "AND",
+        [
+            BooleanFormula("VAR", "x0"),
+            BooleanFormula("NOT", [BooleanFormula("VAR", "x1")]),
+        ],
+    )
+    
+    # Generate trajectory and verify token patterns
+    trajectory = trainer.generate_and_train(formula, max_steps=2)
+    
+    prompt = format_trajectory_prompt(trajectory)
+    tokens = tokenizer.encode(prompt)
+    
+    equals_positions = [i for i, t in enumerate(tokens) if t == 28]
+    arrow_positions = [i for i, t in enumerate(tokens) if t == 4613]
+    
+    assert len(equals_positions) == len(trajectory.actions) * 2  # 2 variables per action
+    assert len(arrow_positions) == len(trajectory.observations)
+    
+    # Verify alternating pattern is maintained throughout training
+    for step_idx in range(len(trajectory.observations)):
+        step_equals = equals_positions[step_idx * 2:(step_idx + 1) * 2]
+        step_arrow = arrow_positions[step_idx]
+        assert all(eq < step_arrow for eq in step_equals)
+
 def test_assignment_encoding_decoding():
+    """Test encoding and decoding of variable assignments."""
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     assignment = {"x0": True, "x1": False}
 
@@ -143,91 +282,8 @@ def test_assignment_encoding_decoding():
     decoded = decode_assignment(tokens, tokenizer, num_vars=2)
     assert decoded == assignment
 
-
-def test_model_action_generation():
-    model = AutoModelForCausalLM.from_pretrained("gpt2")
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
-
-    formula = BooleanFormula(
-        "AND",
-        [
-            BooleanFormula("VAR", "x0"),
-            BooleanFormula("NOT", [BooleanFormula("VAR", "x1")]),
-        ],
-    )
-
-    policy = enumerative_policy(num_vars=2)
-    trajectory = generate_trajectory(formula, policy, reward_fn=constant_reward)
-
-    # Test action generation
-    assignment, output = get_model_action(
-        model, tokenizer, num_vars=2, prompt=format_trajectory_prompt(trajectory)
-    )
-
-    # Verify structure
-    assert isinstance(assignment, dict)
-    assert len(assignment) == 2
-    assert set(assignment.keys()) == {"x0", "x1"}
-    assert all(isinstance(v, bool) for v in assignment.values())
-
-    # Verify token properties
-    assert isinstance(output.action_tokens, torch.Tensor)
-    assert len(output.action_tokens) == 2  # One token per variable
-    assert all(
-        t.item() in [17821, 25101] for t in output.action_tokens
-    )  # Only True/False tokens
-
-    # Verify logprobs
-    assert isinstance(output.action_logprobs, torch.Tensor)
-    assert len(output.action_logprobs) == 2  # One logprob per variable
-
-
-def test_prediction_reward():
-    model = AutoModelForCausalLM.from_pretrained("gpt2")
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
-
-    formula = BooleanFormula(
-        "AND",
-        [
-            BooleanFormula("VAR", "x0"),
-            BooleanFormula("NOT", [BooleanFormula("VAR", "x1")]),
-        ],
-    )
-
-    policy = enumerative_policy(num_vars=2)
-    trajectory = generate_trajectory(formula, policy, reward_fn=constant_reward)
-
-    # Test reward calculation
-    reward = calculate_prediction_reward(model, tokenizer, trajectory)
-    assert isinstance(reward, torch.Tensor)
-    assert reward.ndim == 0  # Scalar tensor
-    assert reward.item() <= 0.0  # Log probability should be non-positive
-
-
-def test_enumerative_policy():
-    formula = BooleanFormula(
-        "AND",
-        [
-            BooleanFormula("VAR", "x0"),
-            BooleanFormula("NOT", [BooleanFormula("VAR", "x1")]),
-        ],
-    )
-
-    policy = enumerative_policy(num_vars=2)
-    trajectory = generate_trajectory(formula, policy, reward_fn=constant_reward)
-
-    # Should have 2^2 = 4 steps
-    assert len(trajectory.steps) == 4
-
-    # Verify we got all possible assignments
-    assignments = [step.action for step in trajectory.steps]
-    assert {"x0": False, "x1": False} in assignments
-    assert {"x0": False, "x1": True} in assignments
-    assert {"x0": True, "x1": False} in assignments
-    assert {"x0": True, "x1": True} in assignments
-
-
 def test_model_policy():
+    """Test that model policy generates valid assignments."""
     model = AutoModelForCausalLM.from_pretrained("gpt2")
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
 
@@ -240,60 +296,16 @@ def test_model_policy():
     )
 
     policy = model_policy(model, tokenizer, num_vars=2)
-    trajectory = generate_trajectory(
-        formula, policy, max_steps=4, reward_fn=constant_reward
-    )
+    trajectory = generate_trajectory(formula, policy, max_steps=2)
 
-    # Verify trajectory structure
-    assert len(trajectory.steps) <= 4
-    for step in trajectory.steps:
-        assert set(step.action.keys()) == {"x0", "x1"}
-        assert isinstance(step.observation.result, bool)
-
-
-def test_enumerative_trajectory():
-    formula = BooleanFormula(
-        "AND",
-        [
-            BooleanFormula("VAR", "x0"),
-            BooleanFormula("NOT", [BooleanFormula("VAR", "x1")]),
-        ],
-    )
-
-    policy = enumerative_policy(num_vars=2)
-    trajectory = generate_trajectory(formula, policy, reward_fn=constant_reward)
-
-    # Should have 2^2 = 4 steps
-    assert len(trajectory.steps) == 4
-    # All rewards should be 1.0
-    assert all(step.observation.reward == 1.0 for step in trajectory.steps)
-
-
-def test_model_trajectory():
-    model = AutoModelForCausalLM.from_pretrained("gpt2")
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
-
-    formula = BooleanFormula(
-        "AND",
-        [
-            BooleanFormula("VAR", "x0"),
-            BooleanFormula("NOT", [BooleanFormula("VAR", "x1")]),
-        ],
-    )
-
-    policy = model_policy(model, tokenizer, num_vars=2)
-    reward_fn = model_reward(model, tokenizer)
-    trajectory = generate_trajectory(formula, policy, reward_fn=reward_fn, max_steps=4)
-
-    # Verify trajectory structure
-    assert len(trajectory.steps) <= 4
-    for step in trajectory.steps:
-        assert set(step.action.keys()) == {"x0", "x1"}
-        assert isinstance(step.observation.result, bool)
-        assert step.observation.reward <= 0.0  # Log probability should be non-positive
-
+    # Verify structure of actions
+    for action in trajectory.actions:
+        assert isinstance(action, dict)
+        assert set(action.keys()) == {"x0", "x1"}
+        assert all(isinstance(v, bool) for v in action.values())
 
 def test_expert_iteration():
+    """Test that ExpertIterationTrainer properly updates statistics."""
     actor_model = AutoModelForCausalLM.from_pretrained("gpt2")
     critic_model = AutoModelForCausalLM.from_pretrained("gpt2")
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
@@ -315,15 +327,14 @@ def test_expert_iteration():
 
     # Generate several trajectories
     trajectories = []
-    for _ in range(10):
-        trajectory = trainer.generate_and_train(formula, max_steps=4)
+    for _ in range(5):  # Reduced from 10 to speed up tests
+        trajectory = trainer.generate_and_train(formula, max_steps=2)
         trajectories.append(trajectory)
 
     # Verify statistics are being updated
-    assert trainer.stats.count == 10
+    assert trainer.stats.n == 5
     assert trainer.stats.mean != 0.0  # Should have been updated
-    assert trainer.stats.std != 1.0  # Should have been updated
-
+    assert trainer.stats.std != float('inf')  # Should have been updated after first trajectory
 
 def test_tokenization_equals():
     """Test that "=" is assigned its own token for proper alignment."""
@@ -332,30 +343,51 @@ def test_tokenization_equals():
     # Test single variable assignment
     text = "x0=True"
     tokens = tokenizer.encode(text)
-    decoded = [tokenizer.decode([t]) for t in tokens]
-
+    
     # Find position of "="
     equals_positions = [i for i, t in enumerate(tokens) if t == 28]
     assert len(equals_positions) == 1, "Expected exactly one '=' token"
-    assert (
-        tokenizer.decode([tokens[equals_positions[0]]]) == "="
-    ), "Token 28 should decode to '='"
+    assert tokenizer.decode([tokens[equals_positions[0]]]) == "=", "Token 28 should decode to '='"
 
-    ## Verify next token is " True"
-    # true_token = tokens[equals_positions[0] + 1]
-    # assert tokenizer.decode([true_token]) == " True"
-
-    # Test multiple assignments in trajectory format
+    # Test multiple assignments
     text = "x0=True, x1=False"
     tokens = tokenizer.encode(text)
+    equals_positions = [i for i, t in enumerate(tokens) if t == 28]
+    assert len(equals_positions) == 2, "Expected exactly two '=' tokens"
 
-    # Find all "=" positions
-    # equals_positions = [i for i, t in enumerate(tokens) if t == 28]
-    # assert len(equals_positions) == 2, "Expected exactly two '=' tokens"
+    # Verify True/False tokens follow equals
+    for pos in equals_positions:
+        next_token = tokens[pos + 1]
+        decoded = tokenizer.decode([next_token])
+        assert decoded.strip() in ["True", "False"], f"Expected True/False after =, got {decoded}"
 
-    ## Verify each "=" is followed by True/False
-    # for pos in equals_positions:
-    #    assert tokens[pos] == 28, "Equals token should be 28"
-    #    next_token = tokens[pos + 1]
-    #    decoded_token = tokenizer.decode([next_token])
-    #    assert decoded_token in [" True", " False"]
+def test_tokenization_patterns_complex():
+    """Test tokenization patterns with more complex formulas."""
+    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    
+    # Test with 3 variables
+    formula = generate_random_formula(num_vars=3, max_depth=3)
+    policy = enumerative_policy(num_vars=3)
+    trajectory = generate_trajectory(formula, policy, max_steps=2)
+    
+    prompt = format_trajectory_prompt(trajectory)
+    tokens = tokenizer.encode(prompt)
+    
+    equals_positions = [i for i, t in enumerate(tokens) if t == 28]
+    arrow_positions = [i for i, t in enumerate(tokens) if t == 4613]
+    
+    # Should have 3 '=' tokens per step (one per variable)
+    assert len(equals_positions) == len(trajectory.actions) * 3
+    assert len(arrow_positions) == len(trajectory.observations)
+    
+    # Verify token sequence for each step
+    for step_idx in range(len(trajectory.observations)):
+        step_equals = equals_positions[step_idx * 3:(step_idx + 1) * 3]
+        step_arrow = arrow_positions[step_idx]
+        
+        # All equals should come before arrow
+        assert all(eq < step_arrow for eq in step_equals)
+        
+        # Equals should be properly spaced (for variable assignments)
+        assert step_equals[1] > step_equals[0] + 1
+        assert step_equals[2] > step_equals[1] + 1

@@ -143,26 +143,43 @@ class Step:
 
 @dataclass
 class Trajectory:
-    formula: BooleanFormula
-    steps: List[Step]
+    observations: List[bool]  # Results of evaluating the formula
+    actions: List[Dict[str, bool]]  # Variable assignments
+    rewards: Optional[List[float]] = None  # Added after trajectory completion
 
 
 PolicyType = Callable[[Trajectory], Dict[str, bool]]
 
 
-def enumerative_policy(num_vars: int) -> PolicyType:
-    """Creates a policy that enumerates all possible assignments in binary order."""
-    assignments = generate_all_assignments(num_vars)
+def enumerative_policy(num_vars: int) -> Callable[[Optional[Trajectory]], Dict[str, bool]]:
+    """
+    Create policy that systematically tries all possible variable assignments.
+    
+    Args:
+        num_vars: Number of variables in formula
+        
+    Returns:
+        Policy function that takes current trajectory and returns next assignment
+    """
+    # Generate all possible assignments
+    assignments = []
+    for i in range(2 ** num_vars):
+        assignment = {}
+        for j in range(num_vars):
+            var_name = f"x{j}"
+            assignment[var_name] = bool((i >> j) & 1)
+        assignments.append(assignment)
+    
     current_idx = 0
-
-    def policy(trajectory: Trajectory) -> Dict[str, bool]:
+    
+    def policy(trajectory: Optional[Trajectory] = None) -> Dict[str, bool]:
         nonlocal current_idx
         if current_idx >= len(assignments):
             raise ValueError("Policy has exhausted all possible assignments")
         assignment = assignments[current_idx]
         current_idx += 1
         return assignment
-
+    
     return policy
 
 
@@ -199,75 +216,108 @@ def model_reward(model: PreTrainedModel, tokenizer: PreTrainedTokenizer) -> Rewa
 
 def generate_trajectory(
     formula: BooleanFormula,
-    policy: PolicyType,
-    reward_fn: RewardType,
+    policy: Callable[[Optional[Trajectory]], Dict[str, bool]],
     max_steps: Optional[int] = None,
 ) -> Trajectory:
     """
-    Generate a trajectory using the given policy to generate actions.
-
+    Generate a trajectory by repeatedly applying policy and evaluating formula.
+    
     Args:
-        formula: The boolean formula to evaluate
-        policy: Function that generates next action given trajectory
-        reward_fn: Function that calculates reward for a trajectory
-        max_steps: Maximum number of steps (None for unlimited)
-
+        formula: Boolean formula to evaluate
+        policy: Function that takes trajectory and returns next assignment
+        max_steps: Maximum number of steps (optional)
+        
     Returns:
-        Trajectory object containing all steps
+        Trajectory with observations and actions (no rewards yet)
     """
-    steps = []
-    step_count = 0
-
-    while max_steps is None or step_count < max_steps:
-        try:
-            # Get action from policy
-            action = policy(Trajectory(formula=formula, steps=steps))
-
-            # Get observation from environment
-            result = formula.evaluate(action)
-
-            # Create partial trajectory to calculate reward
-            partial_trajectory = Trajectory(
-                formula=formula,
-                steps=steps
-                + [
-                    Step(
-                        action=action,
-                        observation=Observation(result=result, reward=0.0),
-                    )
-                ],
-            )
-            reward = reward_fn(partial_trajectory)
-
-            # Add step to trajectory
-            steps.append(
-                Step(
-                    action=action, observation=Observation(result=result, reward=reward)
-                )
-            )
-            step_count += 1
-
-        except ValueError:  # Policy has no more actions
+    observations = []
+    actions = []
+    
+    while True:
+        # Create current trajectory for policy
+        current_trajectory = Trajectory(
+            observations=observations,
+            actions=actions,
+            rewards=None
+        )
+        
+        # Get next action from policy
+        action = policy(current_trajectory)
+        
+        # Evaluate formula with this assignment
+        result = formula.evaluate(action)
+        
+        # Add to trajectory
+        actions.append(action)
+        observations.append(result)
+        
+        # Check termination
+        if max_steps is not None and len(actions) >= max_steps:
             break
+            
+    return Trajectory(observations=observations, actions=actions, rewards=None)
 
-    return Trajectory(formula=formula, steps=steps)
+
+def calculate_trajectory_rewards(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizer,
+    trajectory: Trajectory,
+) -> List[float]:
+    """
+    Calculate rewards for entire trajectory at once.
+    
+    Args:
+        model: Language model to use for predictions
+        tokenizer: Tokenizer for the model
+        trajectory: Trajectory to calculate rewards for
+        
+    Returns:
+        List of rewards (log probabilities of correct results)
+    """
+    # Format full trajectory
+    input_text = format_trajectory_prompt(trajectory)
+    tokens = tokenizer.encode(input_text)
+    input_ids = torch.tensor(tokens).unsqueeze(0)
+    
+    # Get model predictions
+    with torch.no_grad():
+        outputs = model(input_ids=input_ids)
+        logits = outputs.logits
+    
+    # Find all '->' positions
+    arrow_positions = [i for i, t in enumerate(tokens) if t == 4613]
+    
+    # Calculate reward for each step
+    rewards = []
+    for pos, result in zip(arrow_positions, trajectory.observations):
+        next_token_logits = logits[0, pos]
+        true_false_logits = next_token_logits[[tokenizer.encode(" True")[0], 
+                                             tokenizer.encode(" False")[0]]]
+        prob_correct = torch.softmax(true_false_logits, dim=0)[int(not result)]
+        rewards.append(torch.log(prob_correct).item())
+    
+    return rewards
 
 
 def format_trajectory_prompt(trajectory: Trajectory) -> str:
     """
-    Format a trajectory as a prompt for the model.
-    Shows all steps in order.
-
+    Format trajectory as string for model input.
+    
     Args:
-        trajectory: The trajectory object
-
+        trajectory: Trajectory to format
+        
     Returns:
-        Formatted prompt string
+        Formatted string showing variable assignments and results
     """
     lines = []
-    for step in trajectory.steps:
-        vars_str = ", ".join(f"{k}={v}" for k, v in sorted(step.action.items()))
-        lines.append(f"{vars_str} → {step.observation.result}")
+    for action, result in zip(trajectory.actions, trajectory.observations):
+        # Format assignments
+        assignments = [f"{var}={str(val)}" for var, val in sorted(action.items())]
+        assignment_str = ", ".join(assignments)
+        
+        # Add result
+        lines.append(f"{assignment_str} -> {str(result)}")
+        
     return "\n".join(lines)
 
 
@@ -454,123 +504,140 @@ class ExpertIterationTrainer:
         critic_model: PreTrainedModel,
         tokenizer: PreTrainedTokenizer,
         num_vars: int,
-        learning_rate: float = 1e-5,
     ):
-        """
-        Initialize trainer for expert iteration.
-
-        Args:
-            actor_model: Model to be trained for generating actions
-            critic_model: Frozen model for calculating rewards
-            tokenizer: Tokenizer for both models
-            num_vars: Number of variables in formulas
-            learning_rate: Learning rate for actor model updates
-        """
         self.actor_model = actor_model
         self.critic_model = critic_model
         self.tokenizer = tokenizer
         self.num_vars = num_vars
-        self.optimizer = torch.optim.Adam(actor_model.parameters(), lr=learning_rate)
-
-        # Initialize statistics
-        self.stats = TrajectoryStats(mean=-2.0, std=0.1, count=0)
-
-    def calculate_trajectory_reward(self, trajectory: Trajectory) -> float:
-        """Calculate average reward across trajectory steps."""
-        if not trajectory.steps:
-            return 0.0
-        return sum(step.observation.reward for step in trajectory.steps) / len(
-            trajectory.steps
-        )
+        self.stats = RunningStats()
+        self.optimizer = torch.optim.Adam(actor_model.parameters())
+        self.reward_fn = model_reward(critic_model, tokenizer)
 
     def update_stats(self, reward: float):
-        """Update running statistics with new trajectory reward."""
-        n = self.stats.count
-        old_mean = self.stats.mean
-        old_std = self.stats.std
-
-        # Update mean
-        new_mean = (n * old_mean + reward) / (n + 1)
-
-        # Update std using Welford's online algorithm
-        if n > 0:
-            new_std = sqrt(
-                (
-                    n * (old_std**2 + (old_mean - new_mean) ** 2)
-                    + (reward - new_mean) ** 2
-                )
-                / (n + 1)
-            )
-        else:
-            new_std = 1.0
-
-        self.stats = TrajectoryStats(mean=new_mean, std=new_std, count=n + 1)
-
-    def train_on_trajectory(self, trajectory: Trajectory):
-        """
-        Train actor model if trajectory is significantly better than average.
-        Makes the variable assignments (True/False after "=") more likely.
-
-        Args:
-            trajectory: Trajectory to potentially learn from
-        """
-        # Calculate trajectory reward
-        reward = self.calculate_trajectory_reward(trajectory)
-        previous_mean, previous_std = self.stats.mean, self.stats.std
-        # Update statistics
-        self.update_stats(reward)
-
-        # Check if trajectory is good enough to learn from
-        if reward < previous_mean + previous_std:
-            return
-
-        # Prepare input sequence
-        input_text = format_trajectory_prompt(trajectory)
-        tokens = self.tokenizer.encode(input_text)
-        input_ids = torch.tensor(tokens).unsqueeze(0)
-
-        # Create attention mask that only includes True/False tokens after "="
-        attention_mask = torch.zeros_like(input_ids)
-        equals_positions = [i for i, t in enumerate(tokens) if t == 28]  # "=" token ID
-        for pos in equals_positions:
-            attention_mask[0, pos + 1] = 1  # Set position after "=" to 1
-
-        # Train step
-        self.actor_model.train()
-        self.optimizer.zero_grad()
-
-        outputs = self.actor_model(
-            input_ids=input_ids,
-            labels=input_ids,  # Use same sequence as labels
-            attention_mask=attention_mask,  # Only compute loss on True/False tokens
-        )
-        loss = outputs.loss
-        loss.backward()
-        self.optimizer.step()
-
-        self.actor_model.eval()
+        """Update running statistics with new reward."""
+        self.stats.update(reward)
 
     def generate_and_train(
         self, formula: BooleanFormula, max_steps: Optional[int] = None
-    ):
-        """
-        Generate a trajectory and potentially train on it.
-
-        Args:
-            formula: Boolean formula to solve
-            max_steps: Maximum number of steps
-
-        Returns:
-            Generated trajectory
-        """
-        # Create policies and reward function
+    ) -> Trajectory:
+        """Generate trajectory and potentially train on it."""
+        # Create policy
         policy = model_policy(self.actor_model, self.tokenizer, self.num_vars)
-        reward_fn = model_reward(self.critic_model, self.tokenizer)
-
+        
         # Generate trajectory
-        trajectory = generate_trajectory(formula, policy, reward_fn, max_steps)
-
-        # Train if trajectory is good
-        self.train_on_trajectory(trajectory)
-
+        trajectory = generate_trajectory(formula, policy, max_steps)
+        
+        # Calculate rewards
+        rewards = self.reward_fn(trajectory)
+        trajectory.rewards = rewards
+        
+        # Calculate average reward
+        avg_reward = sum(rewards) / len(rewards)
+        
+        # Update statistics
+        previous_mean, previous_std = self.stats.mean, self.stats.std
+        self.update_stats(avg_reward)
+        
+        # Train if trajectory is good enough
+        if avg_reward >= previous_mean + previous_std:
+            self.train_on_trajectory(trajectory)
+            
         return trajectory
+
+
+def calculate_assignment_loss(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizer,
+    trajectory: Trajectory,
+) -> torch.Tensor:
+    """
+    Calculate loss for predicting True/False tokens after "=" in the trajectory.
+    Only considers the variable assignment portion of the trajectory.
+
+    Args:
+        model: Language model to use
+        tokenizer: Tokenizer for the model
+        trajectory: Trajectory to calculate loss for
+
+    Returns:
+        Loss tensor for predicting True/False tokens after "=" positions
+    """
+    input_text = format_trajectory_prompt(trajectory)
+    tokens = tokenizer.encode(input_text)
+    input_ids = torch.tensor(tokens).unsqueeze(0)
+    
+    # Create attention mask for "=" positions
+    attention_mask = torch.zeros_like(input_ids)
+    equals_positions = [i for i, t in enumerate(tokens) if t == 28]
+    for pos in equals_positions:
+        attention_mask[0, pos] = 1
+        
+    outputs = model(
+        input_ids=input_ids,
+        labels=input_ids,
+        attention_mask=attention_mask,
+    )
+    return outputs.loss
+
+
+RewardFunction = Callable[[Trajectory], List[float]]
+
+def constant_reward() -> RewardFunction:
+    """Create reward function that returns constant reward for each step."""
+    def reward_fn(trajectory: Trajectory) -> List[float]:
+        return [0.0] * len(trajectory.observations)
+    return reward_fn
+
+def model_reward(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizer,
+) -> RewardFunction:
+    """
+    Create reward function that calculates reward based on model's prediction accuracy.
+    Returns log probability of correct result at each step.
+    """
+    def reward_fn(trajectory: Trajectory) -> List[float]:
+        # Format full trajectory
+        input_text = format_trajectory_prompt(trajectory)
+        tokens = tokenizer.encode(input_text)
+        input_ids = torch.tensor(tokens).unsqueeze(0)
+        
+        # Get model predictions
+        with torch.no_grad():
+            outputs = model(input_ids=input_ids)
+            logits = outputs.logits
+        
+        # Find all '->' positions
+        arrow_positions = [i for i, t in enumerate(tokens) if t == 4613]
+        
+        # Calculate reward for each step
+        rewards = []
+        for pos, result in zip(arrow_positions, trajectory.observations):
+            next_token_logits = logits[0, pos]
+            true_false_logits = next_token_logits[[tokenizer.encode(" True")[0], 
+                                                 tokenizer.encode(" False")[0]]]
+            prob_correct = torch.softmax(true_false_logits, dim=0)[int(not result)]
+            rewards.append(torch.log(prob_correct).item())
+        
+        return rewards
+    return reward_fn
+
+class RunningStats:
+    """Keep track of mean and standard deviation in an online manner."""
+    def __init__(self):
+        self.n = 0
+        self.mean = 0.0
+        self.M2 = 0.0
+        
+    def update(self, x: float):
+        self.n += 1
+        delta = x - self.mean
+        self.mean += delta / self.n
+        delta2 = x - self.mean
+        self.M2 += delta * delta2
+        
+    @property
+    def std(self) -> float:
+        if self.n < 2:
+            return float('inf')
+        return (self.M2 / (self.n - 1)) ** 0.5

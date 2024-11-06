@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=42"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autocurriculum"
+version = "0.1.0"
+description = "Curriculum learning with boolean formulas"
+
+[tool.pytest.ini_options]
+pythonpath = [
+    "src"
+]
