@@ -1,8 +1,0 @@
-{
-  "num_vars": 2,
-  "max_depth": 3,
-  "max_steps": 4,
-  "num_episodes": 500,
-  "model_name": "gpt2",
-  "print_interval": 20
-}
