@@ -9,6 +9,7 @@ from pathlib import Path
 from datetime import datetime
 import json
 import math
+from bitsandbytes.optim import Adam8bit
 
 OperatorType = Literal["AND", "OR", "NOT", "VAR"]
 
@@ -487,7 +488,7 @@ class ExpertIterationTrainer:
             param.requires_grad = False
 
         self.stats = RunningStats()
-        self.optimizer = torch.optim.Adam(self.actor_model.parameters())
+        self.optimizer = Adam8bit(self.actor_model.parameters(), lr=1e-4)
         self.reward_fn = model_reward(self.critic_model, self.tokenizer)
 
     def update_stats(self, reward: float):
