@@ -67,7 +67,7 @@ def get_default_print_interval(num_vars: int) -> int:
 def get_default_episodes(num_vars: int, gen_mode: str) -> int:
     """Return the number of unique possible formulas for this mode."""
     if gen_mode == "linear":
-        return 2 ** (num_vars + 1) - 1  # 2^n choices for 'a', times 2 choices for 'b', minus all-zeros case
+        return 2 ** (num_vars + 1) - 2  # 2^n choices for 'a', times 2 choices for 'b', minus all-zeros and all-ones cases
     else:  # random
         return 2 ** (2 ** num_vars)  # number of possible truth tables
 
@@ -83,6 +83,8 @@ def main():
                         help='Model to use')
     parser.add_argument('--print-interval', type=int, default=10,
                         help='Number of episodes between progress updates')
+    parser.add_argument('--sd-factor', type=float, default=1.0,
+                        help='Multiplier for the standard deviation when computing training threshold')
 
     args = parser.parse_args()
     
@@ -91,20 +93,6 @@ def main():
         args.num_episodes = get_default_episodes(args.num_vars, args.gen_mode)
         print(f"[INFO] Using default of {args.num_episodes} episodes "
               f"(number of unique {args.gen_mode} formulas for {args.num_vars} variables).")
-
-    # Now check if user specified too many episodes
-    if args.gen_mode == "linear":
-        max_linear_formulas = 2 ** (args.num_vars + 1) - 1
-        if args.num_episodes > max_linear_formulas:
-            print(f"[INFO] Linear formulas: only {max_linear_formulas} unique. "
-                  f"Reducing num_episodes from {args.num_episodes} to {max_linear_formulas}.")
-            args.num_episodes = max_linear_formulas
-    elif args.gen_mode == "random":
-        max_random_formulas = 2 ** (2 ** args.num_vars)  # 2^(2^n)
-        if args.num_episodes > max_random_formulas:
-            print(f"[INFO] Random formulas: only {max_random_formulas} unique. "
-                  f"Reducing num_episodes from {args.num_episodes} to {max_random_formulas}.")
-            args.num_episodes = max_random_formulas
 
     # create output directory
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -119,8 +107,8 @@ def main():
     seen_formulas = set()
 
     # set up models
-    actor_model = AutoModelForCausalLM.from_pretrained(args.model_name)
-    critic_model = AutoModelForCausalLM.from_pretrained(args.model_name)
+    actor_model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16)
+    critic_model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
 
     # move to GPU if available
@@ -129,7 +117,7 @@ def main():
     critic_model.to(device)
 
     # trainer
-    trainer = ExpertIterationTrainer(actor_model, critic_model, tokenizer, num_vars=args.num_vars, device=device)
+    trainer = ExpertIterationTrainer(actor_model, critic_model, tokenizer, num_vars=args.num_vars, device=device, sd_factor=args.sd_factor)
 
     # training loop
     log_file = output_dir / 'trajectories.jsonl'

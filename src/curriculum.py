@@ -274,6 +274,7 @@ def generate_trajectory(
         action_tuple = tuple(action)
 
         if action_tuple in seen_actions:
+            print("duplicate", action_tuple)
             repeated_count += 1
             if gen_mode == "linear" and unused_assignments:
                 # Replace duplicate with random unused assignment
@@ -415,13 +416,14 @@ def get_model_action(
 
             # For the next position, we want T or F
             mask = torch.full_like(logits, float("-inf"))
-            t_token = tokenizer.encode("T")[0]
-            f_token = tokenizer.encode("F")[0]
+            t_token = tokenizer.encode("T", add_special_tokens=False)[0]
+            f_token = tokenizer.encode("F", add_special_tokens=False)[0]
             mask[:, [t_token, f_token]] = 0
             masked_logits = logits + mask
 
             # Sample from masked distribution
             probs = torch.nn.functional.softmax(masked_logits, dim=-1)
+            assert probs.nonzero().shape[-1] == 2
             chosen_token = torch.multinomial(probs[0], num_samples=1)
 
             # Calculate log probability of chosen token
@@ -472,12 +474,14 @@ class ExpertIterationTrainer:
         tokenizer: PreTrainedTokenizer,
         num_vars: int,
         device: torch.device = torch.device("cpu"),
+        sd_factor: float = 1.0,
     ):
         self.actor_model = actor_model
         self.critic_model = critic_model
         self.tokenizer = tokenizer
         self.num_vars = num_vars
         self.device = device
+        self.sd_factor = sd_factor
 
         # Ensure models are on the correct device
         self.actor_model.to(self.device)
@@ -545,15 +549,16 @@ class ExpertIterationTrainer:
         avg_reward = sum(rewards) / len(rewards)
         setattr(trajectory, "avg_reward", avg_reward)
         setattr(trajectory, "was_trained", False)  # Default to False
-        # Store the threshold used for this trajectory
-        setattr(trajectory, "training_threshold", self.stats.mean + self.stats.std)
+        # Store the threshold used for this trajectory, configurable now with sd_factor
+        threshold = self.stats.mean + self.sd_factor * self.stats.std
+        setattr(trajectory, "training_threshold", threshold)
         
         # Update statistics
         previous_mean, previous_std = self.stats.mean, self.stats.std
         self.update_stats(avg_reward)
         
-        # Train if trajectory is good enough
-        if avg_reward >= previous_mean + previous_std:
+        # Train if trajectory is good enough using the configurable threshold
+        if avg_reward >= previous_mean + self.sd_factor * previous_std:
             self.train_on_trajectory(trajectory)
             setattr(trajectory, "was_trained", True)
             
