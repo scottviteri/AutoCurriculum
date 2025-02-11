@@ -209,13 +209,18 @@ def model_reward(
             outputs = model(input_ids=input_ids)
             logits = outputs.logits
         
-        # Find all '->' positions
-        arrow_positions = [i for i, t in enumerate(tokens) if t == 4613]
+        # NEW: Dynamically obtain arrow token id instead of hardcoded 4613.
+        # note the leading space i n " ->"
+        arrow_token_ids = tokenizer.encode(" ->", add_special_tokens=False)
+        if len(arrow_token_ids) != 1:
+            print("Warning: Tokenization for ' ->' did not result in a single token:", arrow_token_ids)
+        arrow_token = arrow_token_ids[0]
+        arrow_positions = [i for i, t in enumerate(tokens) if t == arrow_token]
         
         # Calculate reward for each step
         rewards = []
-        true_token = tokenizer.encode(" True")[0]
-        false_token = tokenizer.encode(" False")[0]
+        true_token = tokenizer.encode(" True", add_special_tokens=False)[0]
+        false_token = tokenizer.encode(" False", add_special_tokens=False)[0]
         
         for pos, result in zip(arrow_positions, trajectory.observations):
             next_token_logits = logits[0, pos]

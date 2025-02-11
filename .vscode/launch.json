@@ -12,8 +12,9 @@
             "console": "integratedTerminal",
             "args": [
                 "--gen-mode", "linear",
-                "--num-vars", "8",
+                "--num-vars", "4",
                 "--num-episodes", "1000",
+                "--model-name", "meta-llama/Meta-Llama-3.1-8B"
             ],
             "justMyCode": false 
         }
