@@ -6,62 +6,62 @@ from typing import List, Dict
 import argparse
 from datetime import datetime
 
-def plot_trajectory_rewards(run_dir: Path):
-    """Plot trajectory rewards as quintile lines."""
-    # Read trajectories
+def plot_trajectory_rewards(output_dir: Path, num_bins: int = 5):
+    """Plot average rewards over time for trajectories, grouped into bins by training order."""
     trajectories = []
-    with open(run_dir / 'trajectories.jsonl', 'r') as f:
+    
+    # Read all trajectories
+    with open(output_dir / 'trajectories.jsonl', 'r') as f:
         for line in f:
-            trajectories.append(json.loads(line))
+            data = json.loads(line)
+            if data['trajectory'].get('rewards'):  # Only include trajectories with rewards
+                trajectories.append({
+                    'rewards': data['trajectory']['rewards'],
+                    'was_trained': data['was_trained']
+                })
+    
+    if not trajectories:
+        return
+    
+    # Split trajectories into bins
+    trained_trajectories = [t for t in trajectories if t['was_trained']]
+    bin_size = max(1, len(trained_trajectories) // num_bins)
     
     # Create figure
     plt.figure(figsize=(10, 6))
     
-    # Calculate quintile lines (5 groups)
-    num_trajs = len(trajectories)
-    quintile_size = num_trajs // 5
-    max_length = max(len(traj['trajectory']['rewards']) 
-                    for traj in trajectories if traj['trajectory']['rewards'])
-    
-    # Initialize arrays for quintiles
-    quintile_rewards = []
-    for i in range(5):
-        start_idx = i * quintile_size
-        end_idx = (i + 1) * quintile_size if i < 4 else num_trajs
-        quintile_trajs = trajectories[start_idx:end_idx]
+    # Plot average rewards for each bin
+    for bin_idx in range(num_bins):
+        start_idx = bin_idx * bin_size
+        end_idx = min(start_idx + bin_size, len(trained_trajectories))
+        if start_idx >= len(trained_trajectories):
+            break
+            
+        bin_trajectories = trained_trajectories[start_idx:end_idx]
         
-        rewards_sum = np.zeros(max_length)
-        counts = np.zeros(max_length)
+        # Find max length and pad shorter trajectories
+        max_len = max(len(t['rewards']) for t in bin_trajectories)
+        padded_rewards = []
+        for t in bin_trajectories:
+            rewards = t['rewards']
+            if len(rewards) < max_len:
+                rewards = rewards + [rewards[-1]] * (max_len - len(rewards))
+            padded_rewards.append(rewards)
         
-        for traj in quintile_trajs:
-            if traj['trajectory']['rewards']:
-                rewards = traj['trajectory']['rewards']
-                rewards_sum[:len(rewards)] += rewards
-                counts[:len(rewards)] += 1
+        # Calculate mean rewards at each step
+        mean_rewards = np.mean(padded_rewards, axis=0)
+        steps = np.arange(len(mean_rewards))
         
-        with np.errstate(divide='ignore', invalid='ignore'):
-            avg_rewards = np.where(counts > 0, rewards_sum / counts, np.nan)
-        quintile_rewards.append(avg_rewards)
-    
-    # Plot quintile lines
-    colors = plt.cm.viridis(np.linspace(0, 1, 5))
-    for i, rewards in enumerate(quintile_rewards):
-        steps = np.arange(1, len(rewards) + 1)
-        valid_mask = ~np.isnan(rewards)
-        plt.plot(steps[valid_mask], rewards[valid_mask], 
-                color=colors[i], 
-                label=f'Trajectories {i*20}%-{(i+1)*20}%',
-                alpha=0.7)
+        label = f'Trajectories {start_idx}-{end_idx-1}'
+        plt.plot(steps, mean_rewards, label=label)
     
     plt.xlabel('Step in Trajectory')
     plt.ylabel('Average Reward')
-    plt.ylim(0, 1)
-    plt.grid(True, alpha=0.3)
+    plt.title('Reward Progression During Training')
     plt.legend()
-    plt.title('Reward Progression Within Trajectories')
+    plt.grid(True)
     
-    plt.tight_layout()
-    plt.savefig(run_dir / 'trajectory_rewards.png')
+    plt.savefig(output_dir / 'trajectory_rewards.png')
     plt.close()
 
     """

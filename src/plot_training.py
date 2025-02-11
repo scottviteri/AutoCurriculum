@@ -30,82 +30,61 @@ def get_default_window_size(num_vars: int) -> int:
     else:
         return 1
 
-def plot_training_progress(run_dir: Path, window_size: Optional[int] = None):
-    """Create plots from training logs and save to run directory."""
-    # Read config to get num_vars
-    with open(run_dir / 'config.json', 'r') as f:
-        config = json.load(f)
-        num_vars = config['num_vars']
+def plot_training_progress(output_dir: Path):
+    """Plot training progress from stats.jsonl file."""
+    stats_file = output_dir / 'stats.jsonl'
+    trajectories_file = output_dir / 'trajectories.jsonl'
     
-    # Set window size if not provided
-    if window_size is None:
-        window_size = get_default_window_size(num_vars)
+    # Read data
+    episodes = []
+    thresholds = []
+    rewards = []
     
-    # Read trajectories and compute average rewards
-    avg_rewards = []
-    training_flags = []
-    thresholds = []  # Add collection of thresholds
-    
-    with open(run_dir / 'trajectories.jsonl', 'r') as f:
+    with open(trajectories_file) as f:
         for line in f:
-            traj = json.loads(line)
-            if traj['trajectory']['rewards']:
-                avg_reward = np.mean(traj['trajectory']['rewards'])
-                avg_rewards.append(avg_reward)
-                training_flags.append(traj['loss'] is not None)
+            data = json.loads(line)
+            rewards.append(data['avg_reward'])
     
-    # Read thresholds from stats file
-    with open(run_dir / 'stats.jsonl', 'r') as f:
+    with open(stats_file) as f:
         for line in f:
-            stats = json.loads(line)
-            thresholds.append(stats['threshold'])
+            data = json.loads(line)
+            episodes.append(data['episode'])
+            thresholds.append(data['threshold'])
     
-    # Compute statistics over windows
-    reward_means, reward_stds, window_episodes = compute_window_stats(avg_rewards, window_size)
-    threshold_means, _, _ = compute_window_stats(thresholds[:len(avg_rewards)], window_size)
+    # Create figure with two subplots
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 10))
     
-    # Compute training ratios for same windows
-    training_ratios = []
-    for i in range(0, len(training_flags), window_size):
-        window = training_flags[i:i+window_size]
-        ratio = sum(window) / len(window)
-        training_ratios.append(ratio)
-    
-    # Create plot
-    fig, ax1 = plt.subplots(figsize=(12, 6))
-    
-    # Plot rewards with error bars
-    color = 'blue'
+    # Plot rewards and threshold
+    ax1.plot(episodes, rewards, label='Average Reward')
+    ax1.plot(episodes, thresholds, label='Training Threshold', linestyle='--')
     ax1.set_xlabel('Episode')
-    ax1.set_ylabel('Average Reward / Threshold', color=color)
-    ax1.errorbar(window_episodes, reward_means, yerr=reward_stds, 
-                color=color, ecolor=color, alpha=0.3, 
-                fmt='o-', capsize=5, label='Reward (mean ± std)')
+    ax1.set_ylabel('Reward')
+    ax1.set_title('Training Progress')
+    ax1.legend()
+    ax1.grid(True)
     
-    # Plot threshold on same axis
-    ax1.plot(window_episodes, threshold_means, color='red', 
-            linestyle=':', label='Training Threshold')
+    # Plot training vs non-training rewards
+    trained_rewards = []
+    untrained_rewards = []
+    with open(trajectories_file) as f:
+        for line in f:
+            data = json.loads(line)
+            if data['was_trained']:
+                trained_rewards.append(data['avg_reward'])
+            else:
+                untrained_rewards.append(data['avg_reward'])
     
-    ax1.tick_params(axis='y', labelcolor=color)
-    ax1.set_ylim(0, 1)
+    if trained_rewards:
+        ax2.hist(trained_rewards, alpha=0.5, label='Trained', bins=20)
+    if untrained_rewards:
+        ax2.hist(untrained_rewards, alpha=0.5, label='Not Trained', bins=20)
+    ax2.set_xlabel('Reward')
+    ax2.set_ylabel('Count')
+    ax2.set_title('Distribution of Rewards')
+    ax2.legend()
     
-    # Plot training ratio on second axis
-    ax2 = ax1.twinx()
-    color = 'green'
-    ax2.set_ylabel('Training Ratio', color=color)
-    ax2.plot(window_episodes, training_ratios, color=color, 
-             linestyle='--', label='Training Ratio')
-    ax2.tick_params(axis='y', labelcolor=color)
-    ax2.set_ylim(0, 1)
-    
-    # Add legends
-    lines1, labels1 = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
-    
-    plt.title('Training Progress')
     plt.tight_layout()
-    plt.savefig(run_dir / 'training_progress.png')
+    plt.savefig(output_dir / 'training_progress.png')
     plt.close()
 
 def find_latest_run(runs_dir: Path) -> Path:

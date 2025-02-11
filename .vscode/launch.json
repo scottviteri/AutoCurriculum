@@ -11,12 +11,11 @@
             "program": "${workspaceFolder}/src/train.py",
             "console": "integratedTerminal",
             "args": [
-                "--num-vars", "2",
-                "--max-depth", "3",
+                "--gen-mode", "linear",
+                "--num-vars", "8",
                 "--num-episodes", "1000",
-                "--print-interval", "20"
             ],
-            "justMyCode": true
+            "justMyCode": false 
         }
     ]
 }

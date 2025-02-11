@@ -8,136 +8,120 @@ from math import sqrt
 from pathlib import Path
 from datetime import datetime
 import json
+import math
 
 OperatorType = Literal["AND", "OR", "NOT", "VAR"]
 
 
 class BooleanFormula:
-    def __init__(
-        self, operator: OperatorType, operands: Union[List["BooleanFormula"], str]
-    ):
-        """
-        Create a boolean formula node.
-
-        Args:
-            operator: One of "AND", "OR", "NOT", or "VAR"
-            operands: For AND/OR: list of subformulas
-                     For NOT: single-element list with subformula
-                     For VAR: string with variable name
-        """
-        self.operator = operator
-        self.operands = operands
-
-        # Validate operands
-        if operator == "VAR":
-            if not isinstance(operands, str):
-                raise ValueError("VAR operator requires string operand")
-        elif operator == "NOT":
-            if not isinstance(operands, list) or len(operands) != 1:
-                raise ValueError("NOT operator requires exactly one operand")
-        elif operator in ["AND", "OR"]:
-            if not isinstance(operands, list) or len(operands) < 2:
-                raise ValueError(f"{operator} operator requires at least two operands")
-        else:
-            raise ValueError(f"Unknown operator: {operator}")
-
+    """
+    Abstract base for a boolean function on n variables.
+    Must implement .evaluate(assignment: Dict[str, bool]) -> bool
+    """
     def evaluate(self, assignment: Dict[str, bool]) -> bool:
-        """
-        Evaluate the formula given an assignment of variables to boolean values.
+        raise NotImplementedError("Subclasses must implement .evaluate()")
 
-        Args:
-            assignment: Dictionary mapping variable names to boolean values
 
-        Returns:
-            Boolean result of evaluating the formula
-        """
-        if self.operator == "VAR":
-            if self.operands not in assignment:
-                raise ValueError(f"Variable {self.operands} not found in assignment")
-            return assignment[self.operands]
+class RandomTableFormula(BooleanFormula):
+    """
+    A formula that is completely random for all 2^n assignments.
+    We store a list of True/False, of length 2^n.
+    """
+    def __init__(self, num_vars: int):
+        super().__init__()
+        self.num_vars = num_vars
+        self.table_size = 2 ** num_vars
+        # For each possible input index, pick True/False at random
+        self.truth_table = [random.choice([False, True]) for _ in range(self.table_size)]
 
-        elif self.operator == "NOT":
-            return not self.operands[0].evaluate(assignment)
-
-        elif self.operator == "AND":
-            return all(op.evaluate(assignment) for op in self.operands)
-
-        elif self.operator == "OR":
-            return any(op.evaluate(assignment) for op in self.operands)
-
-        raise ValueError(f"Unknown operator: {self.operator}")
-
-    def __str__(self) -> str:
-        """Return a string representation of the formula."""
-        if self.operator == "VAR":
-            return self.operands
-
-        elif self.operator == "NOT":
-            return f"NOT({str(self.operands[0])})"
-
-        elif self.operator in ["AND", "OR"]:
-            return f"{self.operator}({', '.join(str(op) for op in self.operands)})"
-
-        raise ValueError(f"Unknown operator: {self.operator}")
+    def evaluate(self, assignment: List[bool]) -> bool:
+        # Convert list of booleans [True,False,...] to an index
+        idx = 0
+        for i, bit_val in enumerate(assignment):
+            if bit_val:
+                idx |= (1 << i)
+        return self.truth_table[idx]
 
     def to_dict(self) -> dict:
-        """Convert formula to a dictionary for JSON serialization."""
-        if self.operator == "VAR":
-            return {"operator": self.operator, "operands": self.operands}
-        else:
-            return {
-                "operator": self.operator,
-                "operands": [op.to_dict() for op in self.operands]
-            }
+        """Return a JSON-friendly dict so we can log this formula."""
+        return {
+            "type": "RandomTableFormula",
+            "num_vars": self.num_vars,
+            "truth_table": [int(b) for b in self.truth_table]  # store 0/1 instead of bool
+        }
 
 
-def generate_random_formula(num_vars: int, max_depth: int) -> BooleanFormula:
+class LinearFormula(BooleanFormula):
     """
-    Generate a random boolean formula with the given number of variables.
-
-    Args:
-        num_vars: Number of variables to use (named x0, x1, ...)
-        max_depth: Maximum depth of the formula tree
-
-    Returns:
-        A random BooleanFormula
+    A formula F(x1..xn) = (a1*x1) XOR (a2*x2) XOR ... (an*xn) XOR b
+    where a1..an,b are random bits in {0,1}.
+    At least one ai must be 1 to avoid constant functions.
+    We'll store them, and evaluate by XORing the indicated bits.
     """
+    def __init__(self, num_vars: int):
+        super().__init__()
+        self.num_vars = num_vars
+        # pick random bits a1..an, ensuring at least one is 1
+        while True:
+            self.a = [random.randint(0,1) for _ in range(num_vars)]
+            if any(self.a):  # at least one coefficient must be 1
+                break
+        self.b = random.randint(0,1)
 
-    def _generate(depth: int) -> BooleanFormula:
-        if depth >= max_depth:
-            # At max depth, just return a variable
-            var_name = f"x{random.randint(0, num_vars-1)}"
-            return BooleanFormula("VAR", var_name)
+    def evaluate(self, assignment: List[bool]) -> bool:
+        val = self.b
+        for i, bit_val in enumerate(assignment):
+            if self.a[i] == 1 and bit_val:
+                val ^= 1
+        return (val == 1)
 
-        # Otherwise, randomly choose an operator
-        operator = random.choice(["AND", "OR", "NOT"])
+    def __str__(self) -> str:
+        """Return a readable representation of the formula."""
+        terms = []
+        for i, coef in enumerate(self.a):
+            if coef == 1:
+                terms.append(f"x{i}")
+        if not terms:  # should never happen now
+            return str(self.b)
+        formula = " XOR ".join(terms)
+        if self.b == 1:
+            formula += " XOR 1"
+        return formula
 
-        if operator == "NOT":
-            return BooleanFormula("NOT", [_generate(depth + 1)])
+    def to_dict(self) -> dict:
+        """Return a JSON-friendly dict so we can log this formula."""
+        return {
+            "type": "LinearFormula",
+            "num_vars": self.num_vars,
+            "a": self.a,    # list of 0/1
+            "b": self.b     # 0 or 1
+        }
 
-        else:  # AND or OR
-            num_operands = 2
-            operands = [_generate(depth + 1) for _ in range(num_operands)]
-            return BooleanFormula(operator, operands)
 
-    return _generate(0)
-
-
-def generate_all_assignments(num_vars: int) -> List[Dict[str, bool]]:
+def generate_boolean_function(num_vars: int, gen_mode: str) -> BooleanFormula:
     """
-    Generate all possible variable assignments for the given number of variables.
+    Create a boolean function in one of two ways:
+    1) "random": random truth table of size 2^n
+    2) "linear": linear XOR-based function
+    """
+    if gen_mode == "random":
+        return RandomTableFormula(num_vars)
+    elif gen_mode == "linear":
+        return LinearFormula(num_vars)
+    else:
+        raise ValueError(f"Unknown gen_mode: {gen_mode}")
 
-    Args:
-        num_vars: Number of variables
 
-    Returns:
-        List of all possible assignments
+def generate_all_assignments(num_vars: int) -> List[List[bool]]:
+    """
+    Generate all possible variable assignments as a list of booleans,
+    e.g. [True,False,...].
     """
     assignments = []
     for i in range(2**num_vars):
-        assignment = {}
+        assignment = []
         for j in range(num_vars):
-            assignment[f"x{j}"] = bool((i >> j) & 1)
+            assignment.append(bool((i >> j) & 1))
         assignments.append(assignment)
     return assignments
 
@@ -145,7 +129,7 @@ def generate_all_assignments(num_vars: int) -> List[Dict[str, bool]]:
 @dataclass
 class Trajectory:
     observations: List[bool]  # Results of evaluating the formula
-    actions: List[Dict[str, bool]]  # Variable assignments
+    actions: List[List[bool]]  # Variable assignments
     rewards: Optional[List[float]] = None  # Added after trajectory completion
 
 
@@ -165,10 +149,9 @@ def enumerative_policy(num_vars: int) -> Callable[[Optional[Trajectory]], Dict[s
     # Generate all possible assignments
     assignments = []
     for i in range(2 ** num_vars):
-        assignment = {}
+        assignment = []
         for j in range(num_vars):
-            var_name = f"x{j}"
-            assignment[var_name] = bool((i >> j) & 1)
+            assignment.append(bool((i >> j) & 1))
         assignments.append(assignment)
     
     current_idx = 0
@@ -221,6 +204,7 @@ def model_reward(
         input_ids = torch.tensor(tokens).unsqueeze(0)
         
         # Get model predictions
+        input_ids = input_ids.to(model.device)
         with torch.no_grad():
             outputs = model(input_ids=input_ids)
             logits = outputs.logits
@@ -247,67 +231,80 @@ def model_reward(
 
 def generate_trajectory(
     formula: BooleanFormula,
-    policy: Callable[[Optional[Trajectory]], Dict[str, bool]],
+    policy: Callable[[Optional[Trajectory]], List[bool]],
     max_steps: Optional[int] = None,
+    gen_mode: str = "random",
 ) -> Trajectory:
     """
     Generate a trajectory by repeatedly applying policy and evaluating formula.
-    
-    Args:
-        formula: Boolean formula to evaluate
-        policy: Function that takes trajectory and returns next assignment
-        max_steps: Maximum number of steps (optional)
-        
-    Returns:
-        Trajectory with observations and actions (no rewards yet)
+    For linear formulas, replace duplicate actions with random unused ones.
+    For random formulas, skip duplicates and continue.
     """
     observations = []
     actions = []
-    
+    seen_actions = set()
+    repeated_count = 0
+
+    # For linear formulas, maintain a set of unused assignments
+    unused_assignments = None
+    if gen_mode == "linear":
+        # Generate all possible assignments if we're in linear mode
+        all_assignments = []
+        for i in range(2 ** len(formula.a)):  # formula.a length is num_vars
+            assignment = []
+            for j in range(len(formula.a)):
+                assignment.append(bool((i >> j) & 1))
+            all_assignments.append(tuple(assignment))
+        unused_assignments = set(all_assignments)
+
     while True:
-        # Create current trajectory for policy
         current_trajectory = Trajectory(
             observations=observations,
             actions=actions,
             rewards=None
         )
         
-        # Get next action from policy
         action = policy(current_trajectory)
-        
-        # Evaluate formula with this assignment
+        action_tuple = tuple(action)
+
+        if action_tuple in seen_actions:
+            repeated_count += 1
+            if gen_mode == "linear" and unused_assignments:
+                # Replace duplicate with random unused assignment
+                action_tuple = random.choice(tuple(unused_assignments))
+                action = list(action_tuple)
+            else:
+                # For random formulas or if no unused assignments left
+                continue
+
+        seen_actions.add(action_tuple)
+        if gen_mode == "linear" and unused_assignments is not None:
+            unused_assignments.discard(action_tuple)
+
         result = formula.evaluate(action)
-        
-        # Add to trajectory
         actions.append(action)
         observations.append(result)
         
-        # Check termination
         if max_steps is not None and len(actions) >= max_steps:
             break
             
-    return Trajectory(observations=observations, actions=actions, rewards=None)
+    traj = Trajectory(observations=observations, actions=actions, rewards=None)
+    setattr(traj, "repeated_count", repeated_count)
+    return traj
 
 
 def format_trajectory_prompt(trajectory: Trajectory) -> str:
     """
-    Format trajectory as string for model input.
-    
-    Args:
-        trajectory: Trajectory to format
-        
-    Returns:
-        Formatted string showing variable assignments and results
+    Convert the Trajectory into a textual representation
+    that the language model can parse.
     """
     lines = []
-    for action, result in zip(trajectory.actions, trajectory.observations):
-        # Format assignments
-        assignments = [f"{var}={str(val)}" for var, val in sorted(action.items())]
-        assignment_str = ", ".join(assignments)
-        
-        # Add result
-        lines.append(f"{assignment_str} -> {str(result)}")
-        
+    for action, obs in zip(trajectory.actions, trajectory.observations):
+        # Convert action to compact string like "[T,F,T,F]"
+        action_str = "[" + ",".join("T" if b else "F" for b in action) + "]"
+        line = f"{action_str} -> {obs}"
+        lines.append(line)
+
     return "\n".join(lines)
 
 
@@ -378,40 +375,43 @@ def get_model_action(
     tokenizer: PreTrainedTokenizer,
     num_vars: int,
     prompt: str,
-) -> Tuple[Dict[str, bool], ModelOutput]:
+) -> Tuple[List[bool], ModelOutput]:
     """
-    Get the model's action (variable assignment) for the current step.
-    Uses constrained sampling to only choose between True/False for each variable.
-
-    Args:
-        model: Language model to use
-        tokenizer: Tokenizer for the model
-        num_vars: Number of variables
-        prompt: Current trajectory formatted as prompt
-
-    Returns:
-        Tuple of (assignment dict, model output)
+    Get the model's action by showing it previous assignments and asking for a new one.
+    Returns a list of booleans representing the new assignment.
     """
-    TRUE_TOKEN = 17821  # Token ID for "True"
-    FALSE_TOKEN = 25101  # Token ID for "False"
+    # Show the model previous assignments and ask for a complete new one
+    full_prompt = (
+        f"{prompt}\n"
+        "Please choose a new assignment that isn't in the list above.\n"
+        "New assignment: ["
+    )
 
+    assignment = []
     action_tokens = []
     action_logprobs = []
-    assignment = {}
 
     for i in range(num_vars):
-        # Add the variable prefix to the prompt
-        var_prompt = f"{prompt}\nx{i}="
-        input_ids = torch.tensor(tokenizer.encode(var_prompt)).unsqueeze(0)
+        # Add what we've built so far plus next position
+        current_prompt = full_prompt + ",".join(
+            "T" if b else "F" for b in assignment
+        )
+        if i > 0:
+            current_prompt += ","
+
+        input_ids = torch.tensor(tokenizer.encode(current_prompt)).unsqueeze(0)
+        input_ids = input_ids.to(model.device)
 
         # Get logits from model
         with torch.no_grad():
             outputs = model(input_ids)
             logits = outputs.logits[:, -1, :]
 
-            # Mask all logits except True/False tokens
+            # For the next position, we want T or F
             mask = torch.full_like(logits, float("-inf"))
-            mask[:, [TRUE_TOKEN, FALSE_TOKEN]] = 0
+            t_token = tokenizer.encode("T")[0]
+            f_token = tokenizer.encode("F")[0]
+            mask[:, [t_token, f_token]] = 0
             masked_logits = logits + mask
 
             # Sample from masked distribution
@@ -428,52 +428,13 @@ def get_model_action(
             action_logprobs.append(log_prob)
 
             # Update assignment
-            is_true = chosen_token.item() == TRUE_TOKEN
-            assignment[f"x{i}"] = is_true
-
-            # Add comma for next variable (except last one)
-            if i < num_vars - 1:
-                prompt = f"{var_prompt}{'True' if is_true else 'False'}, "
+            is_true = (chosen_token.item() == t_token)
+            assignment.append(is_true)
 
     return assignment, ModelOutput(
         action_tokens=torch.cat(action_tokens),
         action_logprobs=torch.cat(action_logprobs),
     )
-
-
-def calculate_assignment_loss(
-    model: PreTrainedModel,
-    tokenizer: PreTrainedTokenizer,
-    trajectory: Trajectory,
-) -> torch.Tensor:
-    """
-    Calculate loss for predicting True/False tokens after "=" in the trajectory.
-    Only considers the variable assignment portion of the trajectory.
-
-    Args:
-        model: Language model to use
-        tokenizer: Tokenizer for the model
-        trajectory: Trajectory to calculate loss for
-
-    Returns:
-        Loss tensor for predicting True/False tokens after "=" positions
-    """
-    input_text = format_trajectory_prompt(trajectory)
-    tokens = tokenizer.encode(input_text)
-    input_ids = torch.tensor(tokens).unsqueeze(0)
-    
-    # Create attention mask for "=" positions
-    attention_mask = torch.zeros_like(input_ids)
-    equals_positions = [i for i, t in enumerate(tokens) if t == 28]
-    for pos in equals_positions:
-        attention_mask[0, pos] = 1
-        
-    outputs = model(
-        input_ids=input_ids,
-        labels=input_ids,
-        attention_mask=attention_mask,
-    )
-    return outputs.loss
 
 
 class RunningStats:
@@ -504,16 +465,22 @@ class ExpertIterationTrainer:
         critic_model: PreTrainedModel,
         tokenizer: PreTrainedTokenizer,
         num_vars: int,
+        device: torch.device = torch.device("cpu"),
     ):
         self.actor_model = actor_model
         self.critic_model = critic_model
-        
+        self.tokenizer = tokenizer
+        self.num_vars = num_vars
+        self.device = device
+
+        # Ensure models are on the correct device
+        self.actor_model.to(self.device)
+        self.critic_model.to(self.device)
+
         # Disable gradients for critic model
         for param in self.critic_model.parameters():
             param.requires_grad = False
-            
-        self.tokenizer = tokenizer
-        self.num_vars = num_vars
+
         self.stats = RunningStats()
         self.optimizer = torch.optim.Adam(self.actor_model.parameters())
         self.reward_fn = model_reward(self.critic_model, self.tokenizer)
@@ -523,25 +490,46 @@ class ExpertIterationTrainer:
         self.stats.update(reward)
 
     def train_on_trajectory(self, trajectory: Trajectory) -> None:
-        """Train the actor model on a trajectory."""
+        """Train the actor model on a trajectory using policy gradient."""
+        # Format trajectory
+        input_text = format_trajectory_prompt(trajectory)
+        print("trajectory")
+        if self.current_formula is not None:
+            print(f"Formula: {self.current_formula}")
+        print(input_text)
+
+        # Get model output on full trajectory
+        tokens = self.tokenizer.encode(input_text)
+        input_ids = torch.tensor(tokens, device=self.device).unsqueeze(0)
+        
         self.optimizer.zero_grad()
-        loss = self.calculate_loss(trajectory)
+        outputs = self.actor_model(
+            input_ids=input_ids,
+            labels=input_ids,
+        )
+        
+        # Weight the loss by rewards
+        loss = outputs.loss * torch.tensor(trajectory.rewards).mean()
         loss.backward()
         self.optimizer.step()
-
-    def calculate_loss(self, trajectory: Trajectory) -> torch.Tensor:
-        """Calculate loss for a trajectory without performing optimization."""
-        return calculate_assignment_loss(self.actor_model, self.tokenizer, trajectory)
 
     def generate_and_train(
         self, formula: BooleanFormula, max_steps: Optional[int] = None
     ) -> Trajectory:
         """Generate trajectory and potentially train on it."""
+        # Store current formula for printing in calculate_loss
+        self.current_formula = formula
+        
         # Create policy
         policy = model_policy(self.actor_model, self.tokenizer, self.num_vars)
         
         # Generate trajectory
-        trajectory = generate_trajectory(formula, policy, max_steps)
+        trajectory = generate_trajectory(
+            formula=formula,
+            policy=policy,
+            max_steps=max_steps,
+            gen_mode=formula.__class__.__name__.replace("Formula", "").lower()
+        )
         
         # Calculate rewards
         rewards = self.reward_fn(trajectory)
@@ -549,6 +537,10 @@ class ExpertIterationTrainer:
         
         # Calculate average reward
         avg_reward = sum(rewards) / len(rewards)
+        setattr(trajectory, "avg_reward", avg_reward)
+        setattr(trajectory, "was_trained", False)  # Default to False
+        # Store the threshold used for this trajectory
+        setattr(trajectory, "training_threshold", self.stats.mean + self.stats.std)
         
         # Update statistics
         previous_mean, previous_std = self.stats.mean, self.stats.std
@@ -557,6 +549,7 @@ class ExpertIterationTrainer:
         # Train if trajectory is good enough
         if avg_reward >= previous_mean + previous_std:
             self.train_on_trajectory(trajectory)
+            setattr(trajectory, "was_trained", True)
             
         return trajectory
 
