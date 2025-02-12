@@ -8,11 +8,13 @@ from transformers import (
     AutoTokenizer
 )
 from dataclasses import asdict
+import random
 
 from curriculum import (
     generate_boolean_function,
     ExpertIterationTrainer,
-    Trajectory
+    Trajectory,
+    LinearFormula
 )
 
 from plot_training import plot_training_progress
@@ -85,84 +87,89 @@ def main():
                         help='Number of episodes between progress updates')
     parser.add_argument('--sd-factor', type=float, default=1.0,
                         help='Multiplier for the standard deviation when computing training threshold')
+    parser.add_argument('--temperature', type=float, default=1.0,
+                        help='Temperature for token sampling')
+    parser.add_argument('--batch-size', type=int, default=1,
+                        help='Batch size for training updates (default: 1)')
 
     args = parser.parse_args()
     
-    # If num_episodes not specified, use the number of unique formulas
     if args.num_episodes is None:
         args.num_episodes = get_default_episodes(args.num_vars, args.gen_mode)
         print(f"[INFO] Using default of {args.num_episodes} episodes "
               f"(number of unique {args.gen_mode} formulas for {args.num_vars} variables).")
-
-    # create output directory
+    
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     output_dir = Path(f'runs/{timestamp}')
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    # save config
+    
     with open(output_dir / 'config.json', 'w') as f:
         json.dump(vars(args), f, indent=2)
-
-    # NEW: set for storing formulas we've seen already
-    seen_formulas = set()
-
-    # set up models
+    
     actor_model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16)
     critic_model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-
-    # move to GPU if available
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     actor_model.to(device)
     critic_model.to(device)
-
-    # trainer
-    trainer = ExpertIterationTrainer(actor_model, critic_model, tokenizer, num_vars=args.num_vars, device=device, sd_factor=args.sd_factor)
-
-    # training loop
+    
+    trainer = ExpertIterationTrainer(actor_model, critic_model, tokenizer, num_vars=args.num_vars, device=device, sd_factor=args.sd_factor, temperature=args.temperature)
+    
     log_file = output_dir / 'trajectories.jsonl'
     stats_file = output_dir / 'stats.jsonl'
     training_count = 0
     episode_count = 0
     local_rewards = []
-    local_repeats = []  # track repeated actions per trajectory since last print
+    local_repeats = []
+    batch_trajectories = []   # List to accumulate trajectories for batched training.
     
-    for episode in range(args.num_episodes):
-        # Generate a new formula we haven't seen before
-        attempt_count = 0
-        while True:
-            attempt_count += 1
-            formula = generate_boolean_function(
-                num_vars=args.num_vars,
-                gen_mode=args.gen_mode
-            )
-            formula_str = json.dumps(formula.to_dict(), sort_keys=True)
-
-            if formula_str not in seen_formulas:
-                seen_formulas.add(formula_str)
-                break
-
-        # Generate trajectory and potentially train
-        trajectory = trainer.generate_and_train(
-            formula=formula,
-            max_steps=2 ** args.num_vars
+    for episode in range(args.num_episodes-1):
+        formula = generate_boolean_function(
+            num_vars=args.num_vars,
+            gen_mode=args.gen_mode
         )
         
-        # Accumulate repeated actions for averaging
+        if args.batch_size > 1:
+            # Generate a batch of trajectories.
+            trajectories = trainer.generate_trajectories_batch(formula, args.batch_size, max_steps=2 ** args.num_vars)
+            # Compute rewards in batch.
+            rewards = trainer.batched_model_reward(trajectories)  # Tensor of shape [B, 2^(num_vars)]
+            for traj, r in zip(trajectories, rewards):
+                avg = r.mean().item()
+                traj.rewards = r.tolist()   # store the entire reward vector if desired
+                traj.avg_reward = avg
+                traj.was_trained = False
+                threshold = trainer.stats.mean + trainer.sd_factor * trainer.stats.std
+                traj.training_threshold = threshold
+                trainer.update_stats(avg)
+            # Filter "good" trajectories meeting the threshold.
+            train_batch = [traj for traj in trajectories if traj.avg_reward >= (trainer.stats.mean + trainer.sd_factor * trainer.stats.std)]
+            if train_batch:
+                try:
+                    trainer.train_on_trajectories(train_batch)
+                    for traj in train_batch:
+                        traj.was_trained = True
+                except Exception as e:
+                    print(f"Error training on batch: {e}")
+            # Log each trajectory.
+            for traj in trajectories:
+                log_trajectory(log_file, traj, traj.avg_reward if traj.was_trained else None, formula)
+        else:
+            trajectory = trainer.generate_and_train(
+                formula=formula,
+                max_steps=2 ** args.num_vars
+            )
+            batch_trajectories = [trajectory]  # create a one-element batch for consistency
+            log_trajectory(log_file, trajectory, trajectory.avg_reward if trajectory.was_trained else None, formula)
+        
         repeated_count = getattr(trajectory, "repeated_count", 0)
         local_repeats.append(repeated_count)
-
-        # Track if we trained on this trajectory
-        if trajectory.was_trained:  # New field we'll add
+        if trajectory.was_trained:
             training_count += 1
         episode_count += 1
-        # Track rewards for all trajectories, not just trained ones
         local_rewards.append(trajectory.avg_reward)
         
-        # Log trajectory, loss, and formula
-        log_trajectory(log_file, trajectory, trajectory.avg_reward if trajectory.was_trained else None, formula)
-        
-        # Log global statistics
         stats = {
             'timestamp': datetime.now().isoformat(),
             'episode': episode,
@@ -175,7 +182,6 @@ def main():
             json.dump(stats, f)
             f.write('\n')
         
-        # Print progress using configured interval
         if episode % args.print_interval == 0 and episode > 0:
             training_ratio = training_count / max(1, episode_count)
             local_mean = sum(local_rewards) / len(local_rewards) if local_rewards else 0
@@ -183,9 +189,7 @@ def main():
                 (sum((r - local_mean) ** 2 for r in local_rewards) / len(local_rewards)) ** 0.5
                 if len(local_rewards) > 1 else 0
             )
-
             avg_repeats = sum(local_repeats) / len(local_repeats) if local_repeats else 0
-
             print(f"Episode {episode}/{args.num_episodes}")
             print(f"Recent mean reward: {local_mean:.3f}")
             print(f"Recent reward std: {local_std:.3f}")
@@ -193,19 +197,23 @@ def main():
             print(f"Training ratio: {training_ratio:.2%}")
             print(f"Average repeated actions: {avg_repeats:.3f}")
             print("-" * 40)
-            
-            # Reset local counters and stats
             training_count = 0
             episode_count = 0
             local_rewards = []
             local_repeats = []
-
-            # NEW: Also plot now, each time we print
+            
             try:
                 plot_training_progress(output_dir)
                 plot_trajectory_rewards(output_dir)
             except Exception as e:
                 print(f"Warning: Failed to create plots: {e}")
+    
+    # Process any remaining trajectories.
+    if batch_trajectories:
+        try:
+            trainer.train_on_trajectories(batch_trajectories)
+        except Exception as e:
+            print(f"Error training on final batch: {e}")
 
 if __name__ == '__main__':
     main() 

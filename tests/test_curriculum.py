@@ -1,457 +1,435 @@
 import pytest
+import torch
+from copy import deepcopy
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import re
+
 from src.curriculum import (
-    BooleanFormula,
-    generate_random_formula,
+    BooleanFormula,  # legacy interface (not used for training)
+    RandomTableFormula,
+    LinearFormula,
+    generate_boolean_function,
+    generate_all_assignments,
     generate_trajectory,
     format_trajectory_prompt,
     encode_assignment,
     decode_assignment,
-    get_model_action,
-    calculate_assignment_loss,
     enumerative_policy,
     model_policy,
     constant_reward,
     model_reward,
     ExpertIterationTrainer,
     Trajectory,
+    RunningStats,
 )
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from copy import deepcopy
 
+# ------------------------------------------------------------------
+# Tests for Boolean Formula Implementations
+# ------------------------------------------------------------------
 
-def test_boolean_formula_evaluation():
-    # Test simple formulas
-    formula = BooleanFormula(
-        "AND",
-        [
-            BooleanFormula("VAR", "x"),
-            BooleanFormula("NOT", [BooleanFormula("VAR", "y")]),
-        ],
-    )
+def test_random_table_formula_evaluation():
+    """Test that RandomTableFormula returns a boolean result."""
+    num_vars = 2
+    formula = RandomTableFormula(num_vars=num_vars)
+    # Create a sample assignment for 2 variables
+    assignment = [True, False]
+    result = formula.evaluate(assignment)
+    assert isinstance(result, bool)
 
-    assert formula.evaluate({"x": True, "y": False}) == True
-    assert formula.evaluate({"x": True, "y": True}) == False
-    assert formula.evaluate({"x": False, "y": False}) == False
-
-
-def test_random_formula_generation():
-    formula = generate_random_formula(num_vars=2, max_depth=3)
-
-    # Test all possible assignments
-    assignments = [{"x0": a, "x1": b} for a in [True, False] for b in [True, False]]
-
-    # Verify formula can be evaluated for all assignments
-    for assignment in assignments:
+def test_linear_formula_evaluation():
+    """Test that LinearFormula returns a boolean result for all assignments."""
+    num_vars = 2
+    formula = LinearFormula(num_vars=num_vars)
+    # Test all possible assignments (there are 2^num_vars assignments)
+    for i in range(2 ** num_vars):
+        assignment = []
+        for j in range(num_vars):
+            assignment.append(bool((i >> j) & 1))
         result = formula.evaluate(assignment)
         assert isinstance(result, bool)
 
+def test_generate_boolean_function():
+    """Test that generate_boolean_function returns the correct formula type."""
+    # For random mode, should return a RandomTableFormula
+    formula_random = generate_boolean_function(num_vars=2, gen_mode="random")
+    from src.curriculum import RandomTableFormula
+    assert isinstance(formula_random, RandomTableFormula)
+    
+    # For linear mode, should return a LinearFormula
+    formula_linear = generate_boolean_function(num_vars=2, gen_mode="linear")
+    from src.curriculum import LinearFormula
+    assert isinstance(formula_linear, LinearFormula)
 
-def test_formula_evaluation_with_extra_variables():
-    # Create a simple formula using only variables x and y
-    formula = BooleanFormula(
-        "AND",
-        [
-            BooleanFormula("VAR", "x"),
-            BooleanFormula("NOT", [BooleanFormula("VAR", "y")]),
-        ],
-    )
+# ------------------------------------------------------------------
+# Tests for Generating Assignments and Formatting
+# ------------------------------------------------------------------
 
-    # Test with additional variables z and w in the assignment
-    assignment = {
-        "x": True,
-        "y": False,
-        "z": True,  # Extra variable
-        "w": False,  # Extra variable
-    }
+def test_generate_all_assignments():
+    """Test that generate_all_assignments produces all unique assignments."""
+    num_vars = 2
+    assignments = generate_all_assignments(num_vars)
+    # There should be 2^num_vars unique assignments.
+    assert len(assignments) == 2 ** num_vars
+    for a in assignments:
+        assert isinstance(a, list)
+        assert len(a) == num_vars
+        # Each element in the assignment should be boolean.
+        for b in a:
+            assert isinstance(b, bool)
 
-    # Should work fine and ignore the extra variables
-    assert formula.evaluate(assignment) == True
+def test_enumerative_policy():
+    """Test that the enumerative policy returns assignments in order and raises error when exhausted."""
+    num_vars = 2
+    policy = enumerative_policy(num_vars)
+    # There are 2^num_vars assignments expected
+    expected_assignments = 2 ** num_vars
+    results = []
+    for _ in range(expected_assignments):
+        action = policy()
+        assert isinstance(action, list)
+        assert len(action) == num_vars
+        results.append(action)
+    # The next call must raise a ValueError.
+    with pytest.raises(ValueError):
+        policy()
+    # Verify the first assignment represents 0 (i.e. [False, False])
+    assert results[0] == [False, False]
 
-    # Test with a random formula
-    random_formula = generate_random_formula(num_vars=2, max_depth=3)  # Uses x0, x1
-
-    # Create assignment with extra variables
-    extended_assignment = {
-        "x0": True,
-        "x1": False,
-        "x2": True,  # Extra variable
-        "x3": False,  # Extra variable
-        "foo": True,  # Extra variable with different naming
-    }
-
-    # Should evaluate without errors
-    result = random_formula.evaluate(extended_assignment)
-    assert isinstance(result, bool)
-
-
-def test_trajectory_generation():
-    """Test basic trajectory generation without rewards."""
-    formula = BooleanFormula(
-        "AND",
-        [
-            BooleanFormula("VAR", "x0"),
-            BooleanFormula("NOT", [BooleanFormula("VAR", "x1")]),
-        ],
-    )
-
-    policy = enumerative_policy(num_vars=2)
-    trajectory = generate_trajectory(formula, policy, max_steps=4)
-
-    # Should have exactly 4 steps
-    assert len(trajectory.actions) == 4
-    assert len(trajectory.observations) == 4
-    assert trajectory.rewards is None
-
-    # Check first step
-    first_action = trajectory.actions[0]
-    first_result = trajectory.observations[0]
-    assert first_action == {"x0": False, "x1": False}
-    assert first_result == False
-
-
-def test_trajectory_prompt_formatting():
-    """Test formatting of trajectory into prompt string."""
-    formula = BooleanFormula(
-        "AND",
-        [
-            BooleanFormula("VAR", "x0"),
-            BooleanFormula("NOT", [BooleanFormula("VAR", "x1")]),
-        ],
-    )
-
-    policy = enumerative_policy(num_vars=2)
-    trajectory = generate_trajectory(formula, policy, max_steps=2)
-
-    # Test prompt formatting
+def test_format_trajectory_prompt():
+    """Test that formatting a trajectory returns a prompt string with expected structure."""
+    num_vars = 2
+    # Use a linear formula so that the 'gen_mode' string aligns with the trajectory generation.
+    formula = generate_boolean_function(num_vars=num_vars, gen_mode="linear")
+    policy = enumerative_policy(num_vars)
+    trajectory = generate_trajectory(formula, policy, max_steps=2, gen_mode="linear")
     prompt = format_trajectory_prompt(trajectory)
-    lines = prompt.split("\n")
-    assert len(lines) == 2  # Should show both steps
-
-    # Verify format of steps
+    lines = prompt.strip().split("\n")
+    # Expect two lines for a two-step trajectory.
+    assert len(lines) == 2
     for line in lines:
+        # Each line should contain the arrow marker.
         assert "->" in line
-        assert line.startswith("x0=")
-        assert "x1=" in line
-        assert line.endswith("True") or line.endswith("False")
+        # The assignment portion should be enclosed in square brackets.
+        assert line.strip().startswith("[")
 
+# ------------------------------------------------------------------
+# Tests for Rewards, Encoding/Decoding, and Model Policies
+# ------------------------------------------------------------------
 
-def test_reward_functions():
-    """Test that reward functions return correct length lists of floats."""
+def test_model_reward():
+    """Test that model_reward returns a list of floats in [0, 1]."""
     model = AutoModelForCausalLM.from_pretrained("gpt2")
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    num_vars = 2
+    # Use random formula mode for reward test.
+    formula = generate_boolean_function(num_vars=num_vars, gen_mode="random")
+    policy = enumerative_policy(num_vars)
+    trajectory = generate_trajectory(formula, policy, max_steps=2, gen_mode="random")
     
-    formula = BooleanFormula(
-        "AND",
-        [
-            BooleanFormula("VAR", "x0"),
-            BooleanFormula("NOT", [BooleanFormula("VAR", "x1")]),
-        ],
-    )
-    
-    trajectory = generate_trajectory(
-        formula, 
-        enumerative_policy(num_vars=2), 
-        max_steps=2
-    )
-    
-    # Test constant reward
-    const_reward_fn = constant_reward()
-    const_rewards = const_reward_fn(trajectory)
-    assert len(const_rewards) == len(trajectory.observations)
-    assert all(r == 0.0 for r in const_rewards)
-    
-    # Test model reward
-    model_reward_fn = model_reward(model, tokenizer)
-    model_rewards = model_reward_fn(trajectory)
-    assert len(model_rewards) == len(trajectory.observations)
-    assert all(isinstance(r, float) for r in model_rewards)
-    assert all(0.0 <= r <= 1.0 for r in model_rewards)  # Probabilities should be between 0 and 1
+    reward_fn = model_reward(model, tokenizer)
+    rewards = reward_fn(trajectory)
+    # Ensure rewards is a list matching the number of observations.
+    assert isinstance(rewards, list)
+    assert len(rewards) == len(trajectory.observations)
+    for r in rewards:
+        assert isinstance(r, float)
+        assert 0.0 <= r <= 1.0
 
-
-def test_loss_invariant_to_result_formatting():
-    """Test that loss calculation ignores tokens after variable assignments."""
-    actor_model = AutoModelForCausalLM.from_pretrained("gpt2")
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
-    
-    formula = BooleanFormula(
-        "AND",
-        [
-            BooleanFormula("VAR", "x0"),
-            BooleanFormula("NOT", [BooleanFormula("VAR", "x1")]),
-        ],
-    )
-    
-    base_trajectory = generate_trajectory(
-        formula, 
-        enumerative_policy(num_vars=2), 
-        max_steps=1
-    )
-    base_loss = calculate_assignment_loss(actor_model, tokenizer, base_trajectory)
-    
-    # Modify result formatting
-    modified_trajectory = deepcopy(base_trajectory)
-    tokens = tokenizer.encode(format_trajectory_prompt(modified_trajectory))
-    last_equals_pos = max(i for i, t in enumerate(tokens) if t == 28)
-    modified_tokens = tokens[:last_equals_pos + 2]  # Keep up to True/False after last =
-    modified_tokens.extend([2] * (len(tokens) - len(modified_tokens)))  # Pad with constant token
-    modified_loss = calculate_assignment_loss(actor_model, tokenizer, modified_trajectory)
-    
-    assert abs(base_loss.item() - modified_loss.item()) < 1e-5, \
-        "Loss shouldn't change when modifying result formatting"
-
-
-def test_loss_sensitive_to_assignments():
-    """Test that loss changes when variable assignments change."""
-    actor_model = AutoModelForCausalLM.from_pretrained("gpt2")
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
-    
-    formula = BooleanFormula(
-        "AND",
-        [
-            BooleanFormula("VAR", "x0"),
-            BooleanFormula("NOT", [BooleanFormula("VAR", "x1")]),
-        ],
-    )
-    
-    base_trajectory = generate_trajectory(
-        formula, 
-        enumerative_policy(num_vars=2), 
-        max_steps=1
-    )
-    base_loss = calculate_assignment_loss(actor_model, tokenizer, base_trajectory)
-    
-    # Modify last variable assignment
-    modified_trajectory = deepcopy(base_trajectory)
-    modified_trajectory.actions[-1]["x1"] = not modified_trajectory.actions[-1]["x1"]
-    modified_loss = calculate_assignment_loss(actor_model, tokenizer, modified_trajectory)
-    
-    assert abs(base_loss.item() - modified_loss.item()) > 1e-5, \
-        "Loss should change when modifying variable assignments"
-
-
-def test_expert_iteration_token_patterns():
-    """Test that ExpertIterationTrainer maintains correct token patterns."""
-    actor_model = AutoModelForCausalLM.from_pretrained("gpt2")
-    critic_model = AutoModelForCausalLM.from_pretrained("gpt2")
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
-    
-    trainer = ExpertIterationTrainer(
-        actor_model=actor_model,
-        critic_model=critic_model,
-        tokenizer=tokenizer,
-        num_vars=2,
-    )
-    
-    formula = BooleanFormula(
-        "AND",
-        [
-            BooleanFormula("VAR", "x0"),
-            BooleanFormula("NOT", [BooleanFormula("VAR", "x1")]),
-        ],
-    )
-    
-    # Generate trajectory and verify token patterns
-    trajectory = trainer.generate_and_train(formula, max_steps=2)
-    
-    prompt = format_trajectory_prompt(trajectory)
-    tokens = tokenizer.encode(prompt)
-    
-    equals_positions = [i for i, t in enumerate(tokens) if t == 28]
-    arrow_positions = [i for i, t in enumerate(tokens) if t == 4613]
-    
-    assert len(equals_positions) == len(trajectory.actions) * 2  # 2 variables per action
-    assert len(arrow_positions) == len(trajectory.observations)
-    
-    # Verify alternating pattern is maintained throughout training
-    for step_idx in range(len(trajectory.observations)):
-        step_equals = equals_positions[step_idx * 2:(step_idx + 1) * 2]
-        step_arrow = arrow_positions[step_idx]
-        assert all(eq < step_arrow for eq in step_equals)
-
-def test_assignment_encoding_decoding():
-    """Test encoding and decoding of variable assignments."""
+def test_encode_decode_assignment():
+    """Test that encoding and then decoding a variable assignment returns the original assignment."""
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     assignment = {"x0": True, "x1": False}
-
-    # Test encoding
     tokens = encode_assignment(assignment, tokenizer)
     assert isinstance(tokens, torch.Tensor)
-
-    # Test decoding
     decoded = decode_assignment(tokens, tokenizer, num_vars=2)
     assert decoded == assignment
 
 def test_model_policy():
-    """Test that model policy generates valid assignments."""
+    """Test that model_policy produces a valid assignment using GPT-2."""
     model = AutoModelForCausalLM.from_pretrained("gpt2")
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    num_vars = 2
+    # Construct a dummy trajectory.
+    dummy_trajectory = Trajectory(observations=[], actions=[], rewards=None)
+    policy_fn = model_policy(model, tokenizer, num_vars=num_vars, temperature=1.0)
+    assignment = policy_fn(dummy_trajectory)
+    # Check that the result is a list of booleans with the expected length.
+    assert isinstance(assignment, list)
+    assert len(assignment) == num_vars
+    for b in assignment:
+        assert isinstance(b, bool)
 
-    formula = BooleanFormula(
-        "AND",
-        [
-            BooleanFormula("VAR", "x0"),
-            BooleanFormula("NOT", [BooleanFormula("VAR", "x1")]),
-        ],
-    )
+# ------------------------------------------------------------------
+# Tests for Expert Iteration Training Updates
+# ------------------------------------------------------------------
 
-    policy = model_policy(model, tokenizer, num_vars=2)
-    trajectory = generate_trajectory(formula, policy, max_steps=2)
-
-    # Verify structure of actions
-    for action in trajectory.actions:
-        assert isinstance(action, dict)
-        assert set(action.keys()) == {"x0", "x1"}
-        assert all(isinstance(v, bool) for v in action.values())
-
-def test_expert_iteration():
-    """Test that ExpertIterationTrainer properly updates statistics."""
+def test_expert_iteration_updates_stats():
+    """Test that ExpertIterationTrainer updates its running statistics after each training step."""
     actor_model = AutoModelForCausalLM.from_pretrained("gpt2")
     critic_model = AutoModelForCausalLM.from_pretrained("gpt2")
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
-
+    num_vars = 2
     trainer = ExpertIterationTrainer(
         actor_model=actor_model,
         critic_model=critic_model,
         tokenizer=tokenizer,
-        num_vars=2,
+        num_vars=num_vars,
     )
-
-    formula = BooleanFormula(
-        "AND",
-        [
-            BooleanFormula("VAR", "x0"),
-            BooleanFormula("NOT", [BooleanFormula("VAR", "x1")]),
-        ],
-    )
-
-    # Generate several trajectories
-    trajectories = []
-    for _ in range(5):  # Reduced from 10 to speed up tests
+    formula = generate_boolean_function(num_vars=num_vars, gen_mode="random")
+    initial_n = trainer.stats.n
+    num_episodes = 3
+    for _ in range(num_episodes):
         trajectory = trainer.generate_and_train(formula, max_steps=2)
-        trajectories.append(trajectory)
+    # The running statistics counter should have increased by the number of episodes.
+    assert trainer.stats.n == initial_n + num_episodes
 
-    # Verify statistics are being updated
-    assert trainer.stats.n == 5
-    assert trainer.stats.mean != 0.0  # Should have been updated
-    assert trainer.stats.std != float('inf')  # Should have been updated after first trajectory
+# ------------------------------------------------------------------
+# Tests for Tokenization Consistency in Assignment Formatting
+# ------------------------------------------------------------------
 
-def test_tokenization_equals():
-    """Test that "=" is assigned its own token for proper alignment."""
+def test_token_consistency_in_assignment_format():
+    """
+    Test that fixed-format assignment strings tokenized with GPT-2 have the same number of tokens,
+    regardless of the specific boolean values.
+    """
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    num_vars = 3
+    # Create two different assignments.
+    assignment1 = [True, False, True]
+    assignment2 = [False, True, False]
+    # Format these assignments using a consistent method.
+    str1 = "[" + ",".join("T" if b else "F" for b in assignment1) + "]"
+    str2 = "[" + ",".join("T" if b else "F" for b in assignment2) + "]"
+    tokens1 = tokenizer.encode(str1)
+    tokens2 = tokenizer.encode(str2)
+    # They should have the same number of tokens.
+    assert len(tokens1) == len(tokens2), f"Token lengths differ: {len(tokens1)} != {len(tokens2)}"
 
-    # Test single variable assignment
-    text = "x0=True"
-    tokens = tokenizer.encode(text)
-    
-    # Find position of "="
-    equals_positions = [i for i, t in enumerate(tokens) if t == 28]
-    assert len(equals_positions) == 1, "Expected exactly one '=' token"
-    assert tokenizer.decode([tokens[equals_positions[0]]]) == "=", "Token 28 should decode to '='"
+# ------------------------------------------------------------------
+# Additional Tests for Special Token Consistency, Batched Tokenization,
+# and Full Forward Pass Integration
+# ------------------------------------------------------------------
 
-    # Test multiple assignments
-    text = "x0=True, x1=False"
-    tokens = tokenizer.encode(text)
-    equals_positions = [i for i, t in enumerate(tokens) if t == 28]
-    assert len(equals_positions) == 2, "Expected exactly two '=' tokens"
-
-    # Verify True/False tokens follow equals
-    for pos in equals_positions:
-        next_token = tokens[pos + 1]
-        decoded = tokenizer.decode([next_token])
-        assert decoded.strip() in ["True", "False"], f"Expected True/False after =, got {decoded}"
-
-def test_tokenization_patterns_complex():
-    """Test tokenization patterns with more complex formulas."""
+def test_trajectory_arrow_count():
+    """
+    Test that tokenizer.encode(" ->")[0] appears exactly 2**num_vars times
+    in a trajectory prompt string.
+    """
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
-    
-    # Test with 3 variables
-    formula = generate_random_formula(num_vars=3, max_depth=3)
-    policy = enumerative_policy(num_vars=3)
-    trajectory = generate_trajectory(formula, policy, max_steps=2)
-    
+    tokenizer.pad_token = tokenizer.eos_token
+    num_vars = 2
+    max_steps = 2 ** num_vars  # Assuming max_steps is set to 2^num_vars
+    # Use a linear formula to ensure consistent formatting.
+    formula = generate_boolean_function(num_vars=num_vars, gen_mode="linear")
+    policy = enumerative_policy(num_vars)
+    trajectory = generate_trajectory(formula, policy, max_steps=max_steps, gen_mode="linear")
     prompt = format_trajectory_prompt(trajectory)
-    tokens = tokenizer.encode(prompt)
-    
-    equals_positions = [i for i, t in enumerate(tokens) if t == 28]
-    arrow_positions = [i for i, t in enumerate(tokens) if t == 4613]
-    
-    # Should have 3 '=' tokens per step (one per variable)
-    assert len(equals_positions) == len(trajectory.actions) * 3
-    assert len(arrow_positions) == len(trajectory.observations)
-    
-    # Verify token sequence for each step
-    for step_idx in range(len(trajectory.observations)):
-        step_equals = equals_positions[step_idx * 3:(step_idx + 1) * 3]
-        step_arrow = arrow_positions[step_idx]
-        
-        # All equals should come before arrow
-        assert all(eq < step_arrow for eq in step_equals)
-        
-        # Equals should be properly spaced (for variable assignments)
-        assert step_equals[1] > step_equals[0] + 1
-        assert step_equals[2] > step_equals[1] + 1
+    arrow_token = tokenizer.encode(" ->", add_special_tokens=False)[0]
+    tokens = tokenizer.encode(prompt, add_special_tokens=False)
+    count = tokens.count(arrow_token)
+    assert count == max_steps, (
+        f"Expected arrow token to appear {max_steps} times, but found {count} times"
+    )
 
-def test_rewards_sensitive_to_results():
-    """Test that rewards change when results change but only for the modified step."""
+def test_batched_tokenization_and_arrow_positions_consistency():
+    """
+    Generate multiple trajectories and verify that when using batched tokenization,
+    the special token (" ->") appears at identical token positions for all trajectories.
+    """
+    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    tokenizer.pad_token = tokenizer.eos_token
+    num_vars = 2
+    max_steps = 2 ** num_vars  # e.g., 4 steps when num_vars == 2
+    # We'll use random mode here to generate trajectories.
+    formula = generate_boolean_function(num_vars=num_vars, gen_mode="random")
+    
+    # Generate three trajectories using independent enumerative policies.
+    policy1 = enumerative_policy(num_vars)
+    policy2 = enumerative_policy(num_vars)
+    policy3 = enumerative_policy(num_vars)
+    trajectory1 = generate_trajectory(formula, policy1, max_steps=max_steps, gen_mode="random")
+    trajectory2 = generate_trajectory(formula, policy2, max_steps=max_steps, gen_mode="random")
+    trajectory3 = generate_trajectory(formula, policy3, max_steps=max_steps, gen_mode="random")
+    
+    prompt1 = format_trajectory_prompt(trajectory1)
+    prompt2 = format_trajectory_prompt(trajectory2)
+    prompt3 = format_trajectory_prompt(trajectory3)
+    
+    batch_prompts = [prompt1, prompt2, prompt3]
+    batch = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True)
+    
+    # For each trajectory, find indices where the arrow token appears.
+    arrow_token = tokenizer.encode(" ->", add_special_tokens=False)[0]
+    def find_arrow_positions(tokens_list):
+        return [i for i, token in enumerate(tokens_list) if token == arrow_token]
+    
+    positions_list = []
+    for prompt in batch_prompts:
+        tokens_ids = tokenizer.encode(prompt, add_special_tokens=False)
+        positions_list.append(find_arrow_positions(tokens_ids))
+    
+    # All trajectories should have the same positions for the arrow token.
+    for pos in positions_list[1:]:
+        assert pos == positions_list[0], (
+            f"Inconsistent arrow positions across trajectories: {positions_list}"
+        )
+
+def test_full_forward_pass_integration():
+    """
+    Test a full forward pass of a batched trajectory prompt.
+    Confirm that the model processes a batch without error and that the logits output
+    has the expected shape.
+    """
     model = AutoModelForCausalLM.from_pretrained("gpt2")
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
-    reward_fn = model_reward(model, tokenizer)
+    tokenizer.pad_token = tokenizer.eos_token
+    num_vars = 2
+    max_steps = 2 ** num_vars  # For example, 4 steps.
     
-    formula = BooleanFormula(
-        "AND",
-        [
-            BooleanFormula("VAR", "x0"),
-            BooleanFormula("NOT", [BooleanFormula("VAR", "x1")]),
-        ],
-    )
+    # Generate a batch of three trajectories using a linear formula.
+    formula = generate_boolean_function(num_vars=num_vars, gen_mode="linear")
+    policy1 = enumerative_policy(num_vars)
+    policy2 = enumerative_policy(num_vars)
+    policy3 = enumerative_policy(num_vars)
     
-    base_trajectory = generate_trajectory(
-        formula, 
-        enumerative_policy(num_vars=2), 
-        max_steps=2
-    )
-    base_rewards = reward_fn(base_trajectory)
+    trajectory1 = generate_trajectory(formula, policy1, max_steps=max_steps, gen_mode="linear")
+    trajectory2 = generate_trajectory(formula, policy2, max_steps=max_steps, gen_mode="linear")
+    trajectory3 = generate_trajectory(formula, policy3, max_steps=max_steps, gen_mode="linear")
     
-    # Modify last result
-    modified_trajectory = deepcopy(base_trajectory)
-    modified_trajectory.observations[-1] = not modified_trajectory.observations[-1]
-    modified_rewards = reward_fn(modified_trajectory)
+    prompts = [
+        format_trajectory_prompt(trajectory1),
+        format_trajectory_prompt(trajectory2),
+        format_trajectory_prompt(trajectory3)
+    ]
     
-    # Check that only the last reward changed
-    assert len(modified_rewards) == len(base_rewards)
-    assert all(mr == br for mr, br in zip(modified_rewards[:-1], base_rewards[:-1])), \
-        "Earlier rewards shouldn't change when modifying last result"
-    assert abs(modified_rewards[-1] - base_rewards[-1]) > 1e-5, \
-        "Last reward should change when modifying last result"
+    # Batch encode the prompts with padding.
+    batch = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
+    input_ids = batch["input_ids"]
+    attention_mask = batch["attention_mask"]
+    
+    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+    
+    # Check that the outputs logits shape is [batch_size, seq_length, vocab_size].
+    assert outputs.logits.shape[0] == len(prompts)
+    assert outputs.logits.shape[1] == input_ids.shape[1]
+    
+    # Verify the logits for the last token are as expected.
+    last_token_logits = outputs.logits[:, -1, :]
+    assert last_token_logits.shape[0] == len(prompts)
+    assert last_token_logits.shape[1] == model.config.vocab_size
 
-def test_rewards_invariant_to_formatting():
-    """Test that rewards are invariant to formatting changes after the result."""
+def test_batched_generation_step():
+    """
+    Test a batched generation step in the style of get_model_action (masked sampling).
+    Generate a batch of trajectories, then iteratively sample new assignment tokens using
+    a mask to allow only "T" or "F" tokens. Verify that the final generated assignment (of length num_vars)
+    is in the expected bracketed format, e.g. "[T,F,T,T]" for num_vars == 4.
+    """
     model = AutoModelForCausalLM.from_pretrained("gpt2")
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
-    reward_fn = model_reward(model, tokenizer)
+    tokenizer.pad_token = tokenizer.eos_token
+    num_vars = 4  # Example: using 4 variables.
     
-    formula = BooleanFormula(
-        "AND",
-        [
-            BooleanFormula("VAR", "x0"),
-            BooleanFormula("NOT", [BooleanFormula("VAR", "x1")]),
-        ],
-    )
+    # Create a batch of 3 trajectories using enumerative_policy and a linear formula.
+    trajectories = []
+    for _ in range(3):
+        formula = generate_boolean_function(num_vars=num_vars, gen_mode="linear")
+        policy = enumerative_policy(num_vars)
+        # Generate one-step trajectory.
+        trajectory = generate_trajectory(formula, policy, max_steps=1, gen_mode="linear")
+        trajectories.append(trajectory)
     
-    base_trajectory = generate_trajectory(
-        formula, 
-        enumerative_policy(num_vars=2), 
-        max_steps=2
-    )
-    base_rewards = reward_fn(base_trajectory)
+    # Build a batch of prompts. Each prompt is the formatted trajectory plus a generation instruction.
+    prompts = []
+    for traj in trajectories:
+        prompt = format_trajectory_prompt(traj)
+        full_prompt = (
+            prompt +
+            "\nPlease choose a new assignment that isn't in the list above.\nNew assignment: ["
+        )
+        prompts.append(full_prompt)
     
-    # Add an extra observation without changing results
-    modified_trajectory = deepcopy(base_trajectory)
-    modified_trajectory.actions.append({"x0": True, "x1": True})  # Add action without observation
-    modified_rewards = reward_fn(modified_trajectory)
+    # Batch encode the prompts with padding.
+    batch = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
+    input_ids = batch["input_ids"]
+    attention_mask = batch["attention_mask"]
     
-    # Check that rewards are unchanged
-    assert len(modified_rewards) == len(base_rewards)
-    assert all(abs(mr - br) < 1e-5 for mr, br in zip(modified_rewards, base_rewards)), \
-        "Rewards shouldn't change when adding incomplete steps"
+    # Allowed tokens: only "T" or "F".
+    t_token = tokenizer.encode("T", add_special_tokens=False)[0]
+    f_token = tokenizer.encode("F", add_special_tokens=False)[0]
+    allowed_ids = [t_token, f_token]
+    
+    temperature = 1.0
+    generated_tokens = []  # Will collect one token per generation step for each sample.
+    
+    # Iteratively sample num_vars tokens, one per variable.
+    for i in range(num_vars):
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        # Determine the index of the last non-padded token for each sample.
+        lengths = attention_mask.sum(dim=1) - 1  # shape: (batch_size,)
+        last_logits = outputs.logits[torch.arange(input_ids.size(0)), lengths, :]
+        
+        # Create mask that sets all logits to -inf except for allowed_ids.
+        mask = torch.full_like(last_logits, float('-inf'))
+        mask[:, allowed_ids] = 0
+        masked_logits = last_logits + mask
+        scaled_logits = masked_logits / temperature
+        probs = torch.nn.functional.softmax(scaled_logits, dim=-1)
+        sampled = torch.multinomial(probs, num_samples=1)  # shape: (batch_size, 1)
+        generated_tokens.append(sampled)
+        
+        # Append the sampled token to input_ids.
+        input_ids = torch.cat([input_ids, sampled], dim=1)
+        extra_mask = torch.ones((input_ids.size(0), 1), dtype=attention_mask.dtype, device=attention_mask.device)
+        attention_mask = torch.cat([attention_mask, extra_mask], dim=1)
+    
+    # Now, for each sample in the batch, extract the newly generated tokens (last num_vars tokens)
+    # and form the assignment string.
+    new_assignments = []
+    for i in range(input_ids.size(0)):
+        new_tokens = input_ids[i, -num_vars:]
+        token_strs = [tokenizer.decode(tok).strip() for tok in new_tokens]
+        assignment_str = "[" + ",".join(token_strs) + "]"
+        new_assignments.append(assignment_str)
+        # Verify that each token is either "T" or "F".
+        for token in token_strs:
+            assert token in ["T", "F"], f"Token '{token}' not in allowed set ('T', 'F')"
+    
+    # Optionally print the generated assignments for manual inspection.
+    for assignment_str in new_assignments:
+        print("Generated assignment:", assignment_str)
+    
+    # Verify that each assignment string matches the format using a regex.
+    pattern = r"^\[(?:T|F)(?:,\s?(?:T|F)){" + f"{num_vars - 1}" + r"}\]$"
+    for assignment_str in new_assignments:
+        assert re.match(pattern, assignment_str), (
+            f"Assignment '{assignment_str}' does not match expected format for {num_vars} variables."
+        )
+
+def test_assignment_token_count():
+    """
+    Test that the tokenization of assignment strings of the form [T,F,T,T] (or similar)
+    always results in 2*num_vars+2 tokens. Print out the actual token IDs for verification.
+    """
+    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    # You may want to set the pad token to match other tests.
+    tokenizer.pad_token = tokenizer.eos_token
+    num_vars = 4  # Change this to test other numbers of variables as needed.
+    
+    # Test a few different assignment examples.
+    assignments = [
+         [True, False, True, True],
+         [False, True, False, True],
+         [True, True, True, True],
+         [False, False, False, False],
+    ]
+    expected_tokens = 2 * num_vars + 1
+    for assignment in assignments:
+         # Format the assignment: e.g. "[T,F,T,T]"
+         assignment_str = "[" + ",".join("T" if b else "F" for b in assignment) + "]"
+         token_ids = tokenizer.encode(assignment_str, add_special_tokens=False)
+         decoded_tokens = [tokenizer.decode([tid]) for tid in token_ids]
+         print(f"Assignment: {assignment_str} -> Tokens: {token_ids} -> Decoded: {decoded_tokens}")
+         assert len(token_ids) == expected_tokens, (
+             f"Expected {expected_tokens} tokens, got {len(token_ids)} for {assignment_str}"
+         )

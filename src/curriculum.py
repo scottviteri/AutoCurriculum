@@ -62,10 +62,9 @@ class LinearFormula(BooleanFormula):
     def __init__(self, num_vars: int):
         super().__init__()
         self.num_vars = num_vars
-        # pick random bits a1..an, ensuring at least one is 1
         while True:
             self.a = [random.randint(0,1) for _ in range(num_vars)]
-            if any(self.a):  # at least one coefficient must be 1
+            if any(self.a):
                 break
         self.b = random.randint(0,1)
 
@@ -97,6 +96,32 @@ class LinearFormula(BooleanFormula):
             "a": self.a,    # list of 0/1
             "b": self.b     # 0 or 1
         }
+
+    @classmethod
+    def from_index(cls, num_vars: int, index: int) -> 'LinearFormula':
+        """
+        Create a LinearFormula from a given index in the range [1, 2^(num_vars+1)-2].
+        We order the formulas as follows:
+          - For each valid a ∈ {1,...,2^num_vars - 1} (ensuring a is nonzero),
+            and for each b ∈ {0,1} (with b ordered as 0 then 1),
+            assign an index. For example, with num_vars = 3, the total count is 2^(3+1)-2 = 14.
+        """
+        total = 2 ** (num_vars + 1) - 2
+        if not (1 <= index <= total):
+            raise ValueError(f"Index {index} out of range for linear formulas with {num_vars} variables")
+        # Convert to 0-indexed.
+        idx = index - 1
+        # For each valid a, there are 2 formulas (one for each b)
+        a_index = idx // 2  # Ranges from 0 to (2^num_vars - 1) - 1.
+        b = idx % 2
+        a_val = a_index + 1  # Shift so that a is in [1, 2^num_vars-1].
+        # Format a_val as binary with fixed width
+        a_bits = list(map(int, bin(a_val)[2:].zfill(num_vars)))
+        instance = cls.__new__(cls)
+        instance.num_vars = num_vars
+        instance.a = a_bits
+        instance.b = b
+        return instance
 
 
 def generate_boolean_function(num_vars: int, gen_mode: str) -> BooleanFormula:
@@ -169,15 +194,13 @@ def enumerative_policy(num_vars: int) -> Callable[[Optional[Trajectory]], Dict[s
 
 
 def model_policy(
-    model: PreTrainedModel, tokenizer: PreTrainedTokenizer, num_vars: int
+    model: PreTrainedModel, tokenizer: PreTrainedTokenizer, num_vars: int, temperature: float = 1.5
 ) -> PolicyType:
-    """Creates a policy that uses language model to generate assignments."""
-
+    """Creates a policy that uses a language model to generate assignments with a given temperature."""
     def policy(trajectory: Trajectory) -> Dict[str, bool]:
         prompt = format_trajectory_prompt(trajectory)
-        assignment, _ = get_model_action(model, tokenizer, num_vars, prompt)
+        assignment, _ = get_model_action(model, tokenizer, num_vars, prompt, temperature=temperature)
         return assignment
-
     return policy
 
 
@@ -274,7 +297,7 @@ def generate_trajectory(
         action_tuple = tuple(action)
 
         if action_tuple in seen_actions:
-            print("duplicate", action_tuple)
+            #print("duplicate", action_tuple)
             repeated_count += 1
             if gen_mode == "linear" and unused_assignments:
                 # Replace duplicate with random unused assignment
@@ -382,6 +405,7 @@ def get_model_action(
     tokenizer: PreTrainedTokenizer,
     num_vars: int,
     prompt: str,
+    temperature: float = 1.5
 ) -> Tuple[List[bool], ModelOutput]:
     """
     Get the model's action by showing it previous assignments and asking for a new one.
@@ -421,13 +445,16 @@ def get_model_action(
             mask[:, [t_token, f_token]] = 0
             masked_logits = logits + mask
 
+            # Apply temperature scaling before softmax:
+            scaled_logits = masked_logits / temperature
+
             # Sample from masked distribution
-            probs = torch.nn.functional.softmax(masked_logits, dim=-1)
+            probs = torch.nn.functional.softmax(scaled_logits, dim=-1)
             assert probs.nonzero().shape[-1] == 2
             chosen_token = torch.multinomial(probs[0], num_samples=1)
 
             # Calculate log probability of chosen token
-            log_prob = torch.nn.functional.log_softmax(masked_logits, dim=-1)[
+            log_prob = torch.nn.functional.log_softmax(scaled_logits, dim=-1)[
                 0, chosen_token
             ]
 
@@ -475,13 +502,18 @@ class ExpertIterationTrainer:
         num_vars: int,
         device: torch.device = torch.device("cpu"),
         sd_factor: float = 1.0,
+        temperature: float = 1.5,
     ):
         self.actor_model = actor_model
         self.critic_model = critic_model
         self.tokenizer = tokenizer
+        # Ensure the tokenizer has a padding token.
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
         self.num_vars = num_vars
         self.device = device
         self.sd_factor = sd_factor
+        self.temperature = temperature
 
         # Ensure models are on the correct device
         self.actor_model.to(self.device)
@@ -500,28 +532,245 @@ class ExpertIterationTrainer:
         self.stats.update(reward)
 
     def train_on_trajectory(self, trajectory: Trajectory) -> None:
-        """Train the actor model on a trajectory using policy gradient."""
-        # Format trajectory
-        input_text = format_trajectory_prompt(trajectory)
-        print("trajectory")
+        # Format the full trajectory prompt (includes both proposals and critic answers)
+        full_prompt = format_trajectory_prompt(trajectory)
+        print("Training on full prompt (with masked answer tokens):")
         if self.current_formula is not None:
             print(f"Formula: {self.current_formula}")
-        print(input_text)
-
-        # Get model output on full trajectory
-        tokens = self.tokenizer.encode(input_text)
+        print(full_prompt)
+        tokens = self.tokenizer.encode(full_prompt)
         input_ids = torch.tensor(tokens, device=self.device).unsqueeze(0)
-        
+        labels = list(tokens)
+        arrow_token_ids = self.tokenizer.encode(" ->", add_special_tokens=False)
+        if len(arrow_token_ids) != 1:
+            print("Warning: Unexpected tokenization for ' ->':", arrow_token_ids)
+        arrow_token = arrow_token_ids[0]
+        i = 0
+        while i < len(labels):
+            if labels[i] == arrow_token:
+                labels[i] = -100
+                if i + 1 < len(labels):
+                    labels[i+1] = -100
+                i += 2
+            else:
+                i += 1
+        labels = torch.tensor(labels, device=self.device).unsqueeze(0)
         self.optimizer.zero_grad()
         outputs = self.actor_model(
             input_ids=input_ids,
-            labels=input_ids,
+            labels=labels,
         )
-        
-        # Weight the loss by rewards
-        loss = outputs.loss * torch.tensor(trajectory.rewards).mean()
+        loss = outputs.loss * torch.tensor(trajectory.rewards, device=self.device).mean()
         loss.backward()
         self.optimizer.step()
+
+    def train_on_trajectories(self, trajectories: list[Trajectory]) -> None:
+        """
+        Batch trains the actor model on a list of trajectories.
+        1. Converts each trajectory into a full prompt (via format_trajectory_prompt)
+           and tokenizes them as a single batch.
+        2. Constructs batched labels by copying the tokenized input and masking tokens corresponding
+           to the " ->" marker and its following token.
+        3. Computes the loss from the batched forward pass, scales it by the average over all trajectories'
+           average rewards, and steps the optimizer.
+        """
+        import torch  # ensure torch is imported
+        # Create a list of full prompts.
+        prompts = [format_trajectory_prompt(traj) for traj in trajectories]
+        batch = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
+        input_ids = batch["input_ids"].to(self.device)
+        attention_mask = batch["attention_mask"].to(self.device)
+        
+        # Build labels by taking a copy of input_ids and masking out tokens corresponding to the critic answers.
+        arrow_token_ids = self.tokenizer.encode(" ->", add_special_tokens=False)
+        if len(arrow_token_ids) != 1:
+            print("Warning: Unexpected tokenization for ' ->':", arrow_token_ids)
+        arrow_token = arrow_token_ids[0]
+        
+        # Create labels for each batch element.
+        batch_labels = []
+        input_ids_list = input_ids.tolist()  # list of token lists
+        for tokens in input_ids_list:
+            labels = tokens.copy()
+            i = 0
+            while i < len(labels):
+                if labels[i] == arrow_token:
+                    labels[i] = -100  # Mask the arrow token.
+                    if i + 1 < len(labels):
+                        labels[i+1] = -100  # Also mask the next token.
+                    i += 2
+                else:
+                    i += 1
+            batch_labels.append(labels)
+        batch_labels = torch.tensor(batch_labels, device=self.device)
+        
+        self.optimizer.zero_grad()
+        outputs = self.actor_model(input_ids=input_ids, labels=batch_labels)
+        
+        # Scale loss by the mean of the average rewards from each trajectory.
+        avg_rewards = torch.tensor([traj.avg_reward for traj in trajectories], device=self.device)
+        scale = avg_rewards.mean()
+        loss = outputs.loss * scale
+        loss.backward()
+        self.optimizer.step()
+
+    def generate_trajectories_batch(self, formula: BooleanFormula, batch_size: int, max_steps: int) -> list[Trajectory]:
+        """
+        Batch generates trajectories for the given formula.
+        For each trajectory, maintain a set of available assignments (in bracketed string format)
+        and a set of seen assignments. At each generation step, use batched sampling (masked to allow only
+        tokens corresponding to "T" or "F") to propose the next token. If the candidate assignment (when concatenated)
+        has already been seen in that trajectory, replace it by sampling a random assignment from the remaining
+        available set, incrementing the trajectory's repeated_count.
+        
+        Returns a list of Trajectory objects with a complete assignment in trajectory.actions
+        and corresponding observations.
+        """
+        # Initialize batch of trajectories.
+        trajectories = []
+        full_assignments = ["[" + ",".join("T" if b else "F" for b in assign) + "]" 
+                            for assign in generate_all_assignments(self.num_vars)]
+        for _ in range(batch_size):
+            traj = Trajectory(actions=[], observations=[], rewards=[])
+            traj.repeated_count = 0
+            # Each trajectory gets its own available assignments set (deepcopy not needed, as we rebuild from full_assignments)
+            traj.available_assignments = set(full_assignments)
+            traj.seen_assignments = set()
+            traj.generated_tokens = ""  # will accumulate tokens for the assignment
+            trajectories.append(traj)
+        
+        # For each generation step (we expect exactly num_vars tokens per assignment)
+        for step in range(self.num_vars):
+            # Build batched prompts: each prompt = full prompt so far + instruction for new token.
+            prompts = []
+            for traj in trajectories:
+                base_prompt = format_trajectory_prompt(traj)
+                # Append generation instruction similar to get_model_action.
+                prompt = base_prompt + "\nPlease choose an unseen boolean variable assignment in the form [X,Y,...].\nNew assignment: ["
+                prompts.append(prompt)
+            
+            batch_enc = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
+            input_ids = batch_enc["input_ids"].to(self.device)
+            attention_mask = batch_enc["attention_mask"].to(self.device)
+            
+            # Allowed tokens: only "T" and "F"
+            t_token = self.tokenizer.encode("T", add_special_tokens=False)[0]
+            f_token = self.tokenizer.encode("F", add_special_tokens=False)[0]
+            allowed_ids = [t_token, f_token]
+            
+            outputs = self.actor_model(input_ids=input_ids, attention_mask=attention_mask)
+            lengths = attention_mask.sum(dim=1) - 1  # index of last non-padded token for each sample
+            last_logits = outputs.logits[torch.arange(input_ids.size(0)), lengths, :]
+            
+            # Mask logits: allow only allowed_ids tokens.
+            mask = torch.full_like(last_logits, float('-inf'))
+            mask[:, allowed_ids] = 0
+            scaled_logits = (last_logits + mask) / self.temperature
+            probs = torch.nn.functional.softmax(scaled_logits, dim=-1)
+            sampled = torch.multinomial(probs, num_samples=1).squeeze(1)  # shape: (batch_size,)
+            
+            for i, traj in enumerate(trajectories):
+                new_token = self.tokenizer.decode([sampled[i]]).strip()
+                candidate = traj.generated_tokens + new_token  # candidate assignment so far
+                full_candidate = "[" + candidate + "]"
+                if full_candidate in traj.seen_assignments:
+                    # Duplicate detected: choose a random remaining assignment.
+                    if traj.available_assignments:
+                        replacement = random.choice(list(traj.available_assignments))
+                        traj.available_assignments.remove(replacement)
+                        traj.repeated_count += 1
+                        candidate = replacement[1:-1]  # remove brackets
+                        full_candidate = replacement
+                    # If no alternative remains, continue with candidate.
+                else:
+                    # Accept candidate and remove from available if present.
+                    if full_candidate in traj.available_assignments:
+                        traj.available_assignments.remove(full_candidate)
+                    traj.seen_assignments.add(full_candidate)
+                traj.generated_tokens = candidate
+                # If this is the final token, record the complete assignment and observation.
+                if step == self.num_vars - 1:
+                    traj.actions.append("[" + candidate + "]")
+                    # Convert candidate (e.g., "TFTF") into a list of booleans.
+                    action_list = [True if ch == "T" else False for ch in candidate]
+                    observation = formula.evaluate(action_list)
+                    traj.observations.append(observation)
+        return trajectories
+
+    def batched_model_reward(self, trajectories: list[Trajectory]) -> Tensor:
+        """
+        Batched reward computation for a list of trajectories.
+        For each trajectory, the full prompt is tokenized and all occurrences of the arrow token
+        (" ->") are identified. For each occurrence, the token immediately following (i.e. index+1)
+        is used to retrieve its log-probability from the critic model's output.
+        Returns a tensor of shape [batch_size, 2^(num_vars)], where each row contains the log-probs
+        for each proposal.
+        """
+        # Get full prompts for the batch.
+        prompts = [format_trajectory_prompt(traj) for traj in trajectories]
+        arrow_token = self.tokenizer.encode(" ->", add_special_tokens=False)[0]
+        expected = 2 ** self.num_vars
+
+        # For each prompt, tokenize (without padding) and search for all occurrences of arrow_token.
+        token_lists = [self.tokenizer.encode(p, add_special_tokens=False) for p in prompts]
+        reward_indices_list = []
+        for tokens in token_lists:
+            indices = [i + 1 for i, t in enumerate(tokens) if t == arrow_token and (i + 1) < len(tokens)]
+            assert len(indices) == expected
+            reward_indices_list.append(indices)
+
+        # Obtain batched encoding (with padding/truncation) of prompts.
+        batch_enc = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
+        input_ids = batch_enc["input_ids"].to(self.device)
+        attention_mask = batch_enc["attention_mask"].to(self.device)
+        
+        with torch.no_grad():
+            outputs = self.critic_model(input_ids=input_ids, attention_mask=attention_mask)
+        log_probs = torch.nn.functional.log_softmax(outputs.logits, dim=-1)
+
+        batch_rewards = []
+        for i, indices in enumerate(reward_indices_list):
+            traj_rewards = []
+            for idx in indices:
+                if idx == -1 or idx >= input_ids.size(1):
+                    traj_rewards.append(torch.tensor(float('-inf'), device=self.device))
+                else:
+                    token_id = input_ids[i, idx]
+                    lp = log_probs[i, idx, token_id]
+                    traj_rewards.append(lp)
+            traj_rewards_tensor = torch.stack(traj_rewards)  # shape: [expected]
+            batch_rewards.append(traj_rewards_tensor)
+
+        return torch.stack(batch_rewards)  # Tensor of shape [batch_size, expected]
+
+    def generate_and_train(self, formula: BooleanFormula, max_steps: Optional[int] = None) -> Trajectory:
+        """
+        Single trajectory generation and training (for backward compatibility).
+        Uses the old non-batched method.
+        """
+        self.current_formula = formula
+        policy = model_policy(self.actor_model, self.tokenizer, self.num_vars, temperature=self.temperature)
+        trajectory = generate_trajectory(
+            formula=formula,
+            policy=policy,
+            max_steps=max_steps,
+            gen_mode=formula.__class__.__name__.replace("Formula", "").lower()
+        )
+        rewards = self.reward_fn(trajectory)
+        trajectory.rewards = rewards
+        avg_reward = sum(rewards) / len(rewards)
+        setattr(trajectory, "avg_reward", avg_reward)
+        setattr(trajectory, "was_trained", False)
+        threshold = self.stats.mean + self.sd_factor * self.stats.std
+        setattr(trajectory, "training_threshold", threshold)
+        previous_mean, previous_std = self.stats.mean, self.stats.std
+        self.update_stats(avg_reward)
+        if avg_reward >= previous_mean + self.sd_factor * previous_std:
+            self.train_on_trajectory(trajectory)
+            setattr(trajectory, "was_trained", True)
+        return trajectory
+
+# ... end of ExpertIterationTrainer class, and rest of file
 
     def generate_and_train(
         self, formula: BooleanFormula, max_steps: Optional[int] = None
@@ -530,8 +779,8 @@ class ExpertIterationTrainer:
         # Store current formula for printing in calculate_loss
         self.current_formula = formula
         
-        # Create policy
-        policy = model_policy(self.actor_model, self.tokenizer, self.num_vars)
+        # Create policy with the configured temperature
+        policy = model_policy(self.actor_model, self.tokenizer, self.num_vars, temperature=self.temperature)
         
         # Generate trajectory
         trajectory = generate_trajectory(
