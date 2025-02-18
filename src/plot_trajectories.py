@@ -6,6 +6,32 @@ from typing import List, Dict
 import argparse
 from datetime import datetime
 
+def group_trajectories(trajectories: List[Dict], batch_size: int) -> List[Dict]:
+    """
+    Group consecutive trajectories in groups of size batch_size.
+    For each group, average the rewards element‐wise (padding shorter lists if needed)
+    and set was_trained True if any trajectory in the group was trained.
+    """
+    grouped = []
+    for i in range(0, len(trajectories), batch_size):
+        group = trajectories[i:i+batch_size]
+        # Determine maximum length of rewards across group.
+        max_len = max(len(traj['rewards']) for traj in group)
+        padded = []
+        for traj in group:
+            r = traj['rewards']
+            if len(r) == 0:
+                # If rewards are empty, fill with zeros.
+                r = [0] * max_len
+            elif len(r) < max_len:
+                r = r + [r[-1]] * (max_len - len(r))
+            padded.append(r)
+        averaged = np.mean(padded, axis=0).tolist()
+        # Mark group as trained if any member was trained.
+        was_trained = any(traj['was_trained'] for traj in group)
+        grouped.append({'rewards': averaged, 'was_trained': was_trained})
+    return grouped
+
 def plot_trajectory_rewards(output_dir: Path, num_bins: int = 5):
     """Plot average rewards over time for trajectories, grouped into bins by training order."""
     trajectories = []
@@ -23,7 +49,28 @@ def plot_trajectory_rewards(output_dir: Path, num_bins: int = 5):
     if not trajectories:
         return
     
-    # Split trajectories into bins
+    # Normalize rewards lengths: if a trajectory's rewards length is even and significantly longer than median,
+    # assume that rewards are doubled (e.g. due to batched generation) and downsample by averaging consecutive pairs.
+    lengths = [len(t['rewards']) for t in trajectories]
+    median_length = np.median(lengths)
+    for t in trajectories:
+        L = len(t['rewards'])
+        if L % 2 == 0 and L >= 1.5 * median_length:
+            r = t['rewards']
+            downsampled = [ (r[2*i] + r[2*i+1]) / 2.0 for i in range(L//2) ]
+            t['rewards'] = downsampled
+    
+    # Read batch_size from config.json (if available) instead of CLI args.
+    config_path = output_dir / 'config.json'
+    batch_size = None
+    if config_path.exists():
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        batch_size = config.get('batch_size', None)
+    if batch_size is not None:
+        trajectories = group_trajectories(trajectories, batch_size)
+
+    # Split trajectories into bins based on trained trajectories.
     trained_trajectories = [t for t in trajectories if t['was_trained']]
     bin_size = max(1, len(trained_trajectories) // num_bins)
     

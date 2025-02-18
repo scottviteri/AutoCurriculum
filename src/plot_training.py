@@ -35,22 +35,40 @@ def plot_training_progress(output_dir: Path):
     stats_file = output_dir / 'stats.jsonl'
     trajectories_file = output_dir / 'trajectories.jsonl'
     
-    # Read data
+    # Read data from stats.jsonl (one record per main loop iteration)
     episodes = []
     thresholds = []
     rewards = []
-    
-    with open(trajectories_file) as f:
-        for line in f:
-            data = json.loads(line)
-            rewards.append(data['avg_reward'])
-    
     with open(stats_file) as f:
         for line in f:
             data = json.loads(line)
             episodes.append(data['episode'])
+            rewards.append(data['avg_reward'])
             thresholds.append(data['threshold'])
-    
+
+    # Read batch_size from config.json (if available) instead of CLI args.
+    config_path = output_dir / 'config.json'
+    batch_size = None
+    if config_path.exists():
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        batch_size = config.get('batch_size', None)
+    if batch_size is not None and len(episodes) > 0:
+        grouped_eps = []
+        grouped_thresh = []
+        grouped_rewards = []
+        # Group every batch_size episodes together by taking the mean.
+        for i in range(0, len(episodes), batch_size):
+            batch_eps = episodes[i:i+batch_size]
+            batch_thresh = thresholds[i:i+batch_size]
+            batch_rewards = rewards[i:i+batch_size]
+            grouped_eps.append(np.mean(batch_eps) if len(batch_eps) > 0 else 0)
+            grouped_thresh.append(np.mean(batch_thresh) if len(batch_thresh) > 0 else 0)
+            grouped_rewards.append(np.mean(batch_rewards) if len(batch_rewards) > 0 else 0)
+        episodes = grouped_eps
+        thresholds = grouped_thresh
+        rewards = grouped_rewards
+
     # Create figure with two subplots
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 10))
     

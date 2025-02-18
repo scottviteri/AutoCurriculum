@@ -55,17 +55,6 @@ def log_trajectory(file_path: Path, trajectory: Trajectory, loss: float, formula
         json.dump(entry, f, cls=TrajectoryEncoder)
         f.write('\n')
 
-def get_default_print_interval(num_vars: int) -> int:
-    """Return appropriate print interval based on number of variables."""
-    if num_vars == 2:
-        return 20
-    elif num_vars == 3:
-        return 10
-    elif num_vars == 4:
-        return 5
-    else:
-        return 1
-
 def get_default_episodes(num_vars: int, gen_mode: str) -> int:
     """Return the number of unique possible formulas for this mode."""
     if gen_mode == "linear":
@@ -131,20 +120,25 @@ def main():
         )
         
         if args.batch_size > 1:
-            # Generate a batch of trajectories.
-            trajectories = trainer.generate_trajectories_batch(formula, args.batch_size, max_steps=2 ** args.num_vars)
-            # Compute rewards in batch.
-            rewards = trainer.batched_model_reward(trajectories)  # Tensor of shape [B, 2^(num_vars)]
-            for traj, r in zip(trajectories, rewards):
+            # Generate a batch of trajectories using batched generation.
+            trajectories = trainer.generate_trajectories_batch(formula, batch_size=args.batch_size, max_steps=2**args.num_vars)
+            # Compute rewards for the entire batch.
+            rewards_tensor = trainer.batched_model_reward(trajectories)  # Tensor of shape [batch_size, L]
+            # Update each trajectory with its average reward and training threshold.
+            for i, traj in enumerate(trajectories):
+                r = rewards_tensor[i]
                 avg = r.mean().item()
-                traj.rewards = r.tolist()   # store the entire reward vector if desired
+                traj.rewards = r.tolist()
                 traj.avg_reward = avg
                 traj.was_trained = False
-                threshold = trainer.stats.mean + trainer.sd_factor * trainer.stats.std
-                traj.training_threshold = threshold
+                current_threshold = trainer.stats.mean + trainer.sd_factor * trainer.stats.std
+                traj.training_threshold = current_threshold
                 trainer.update_stats(avg)
-            # Filter "good" trajectories meeting the threshold.
-            train_batch = [traj for traj in trajectories if traj.avg_reward >= (trainer.stats.mean + trainer.sd_factor * trainer.stats.std)]
+
+            # Recompute current threshold.
+            current_threshold = trainer.stats.mean + trainer.sd_factor * trainer.stats.std
+            # Filter trajectories that meet the threshold.
+            train_batch = [traj for traj in trajectories if traj.avg_reward >= current_threshold]
             if train_batch:
                 try:
                     trainer.train_on_trajectories(train_batch)
@@ -152,27 +146,39 @@ def main():
                         traj.was_trained = True
                 except Exception as e:
                     print(f"Error training on batch: {e}")
+
             # Log each trajectory.
             for traj in trajectories:
                 log_trajectory(log_file, traj, traj.avg_reward if traj.was_trained else None, formula)
+
+            # Update cumulative stats for all trajectories in the batch.
+            for traj in trajectories:
+                local_repeats.append(getattr(traj, "repeated_count", 0))
+                local_rewards.append(traj.avg_reward)
+                if traj.was_trained:
+                    training_count += 1
+                episode_count += 1
         else:
             trajectory = trainer.generate_and_train(
                 formula=formula,
-                max_steps=2 ** args.num_vars
+                max_steps=args.num_vars
             )
-            batch_trajectories = [trajectory]  # create a one-element batch for consistency
             log_trajectory(log_file, trajectory, trajectory.avg_reward if trajectory.was_trained else None, formula)
+            local_repeats.append(getattr(trajectory, "repeated_count", 0))
+            local_rewards.append(trajectory.avg_reward)
+            if trajectory.was_trained:
+                training_count += 1
+                episode_count += 1
         
-        repeated_count = getattr(trajectory, "repeated_count", 0)
-        local_repeats.append(repeated_count)
-        if trajectory.was_trained:
-            training_count += 1
-        episode_count += 1
-        local_rewards.append(trajectory.avg_reward)
-        
+        if args.batch_size > 1:
+            current_mean = sum([traj.avg_reward for traj in trajectories]) / len(trajectories)
+        else:
+            current_mean = trajectory.avg_reward
+            
         stats = {
             'timestamp': datetime.now().isoformat(),
             'episode': episode,
+            'avg_reward': current_mean,
             'mean': trainer.stats.mean,
             'std': trainer.stats.std,
             'n': trainer.stats.n,
@@ -191,11 +197,11 @@ def main():
             )
             avg_repeats = sum(local_repeats) / len(local_repeats) if local_repeats else 0
             print(f"Episode {episode}/{args.num_episodes}")
-            print(f"Recent mean reward: {local_mean:.3f}")
-            print(f"Recent reward std: {local_std:.3f}")
-            print(f"Global training threshold: {trainer.stats.mean + trainer.stats.std:.3f}")
-            print(f"Training ratio: {training_ratio:.2%}")
-            print(f"Average repeated actions: {avg_repeats:.3f}")
+            print(f"Recent mean reward: {local_mean}")
+            print(f"Recent reward std: {local_std}")
+            print(f"Global training threshold: {trainer.stats.mean + trainer.stats.std}")
+            print(f"Training ratio: {training_ratio}")
+            print(f"Average repeated actions: {avg_repeats}")
             print("-" * 40)
             training_count = 0
             episode_count = 0
