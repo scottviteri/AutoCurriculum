@@ -64,13 +64,13 @@ def get_default_episodes(num_vars: int, gen_mode: str) -> int:
 
 def main():
     parser = argparse.ArgumentParser(description='Train boolean formula solver')
-    parser.add_argument('--num-vars', type=int, default=2, help='Number of variables in formulas')
-    parser.add_argument('--gen-mode', type=str, default='random',
+    parser.add_argument('--num-vars', type=int, default=4, help='Number of variables in formulas')
+    parser.add_argument('--gen-mode', type=str, default='linear',
                         choices=['random','linear'],
                         help='Which kind of boolean function to generate (random or linear).')
-    parser.add_argument('--num-episodes', type=int, default=None,
+    parser.add_argument('--num-episodes', type=int, default=1000,
                         help='Number of training episodes')
-    parser.add_argument('--model-name', type=str, default='gpt2',
+    parser.add_argument('--model-name', type=str, default='meta-llama/Meta-Llama-3.1-8B',
                         help='Model to use')
     parser.add_argument('--print-interval', type=int, default=10,
                         help='Number of episodes between progress updates')
@@ -78,7 +78,7 @@ def main():
                         help='Multiplier for the standard deviation when computing training threshold')
     parser.add_argument('--temperature', type=float, default=1.0,
                         help='Temperature for token sampling')
-    parser.add_argument('--batch-size', type=int, default=1,
+    parser.add_argument('--batch-size', type=int, default=8,
                         help='Batch size for training updates (default: 1)')
 
     args = parser.parse_args()
