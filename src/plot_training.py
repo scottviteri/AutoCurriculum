@@ -36,13 +36,16 @@ def plot_training_progress(output_dir: Path) -> None:
     if not stats_file.exists():
         return
     
-    # Read config to get sd_factor
+    # Read config to get sd_factor and num_vars
     config_file = output_dir / 'config.json'
     sd_factor = 1.0
+    num_vars = 4  # default
     if config_file.exists():
         with open(config_file) as f:
             config = json.load(f)
         sd_factor = config.get('sd_factor', 1.0)
+        num_vars = config.get('num_vars', 4)
+    max_steps = 2 ** num_vars
     
     episodes = []
     means = []
@@ -52,6 +55,7 @@ def plot_training_progress(output_dir: Path) -> None:
     normalized_rewards = []
     avg_rewards = []
     total_episodes = []
+    avg_repeats = []
     
     with open(stats_file) as f:
         for line in f:
@@ -64,6 +68,10 @@ def plot_training_progress(output_dir: Path) -> None:
             normalized_rewards.append(data['normalized_reward'])
             avg_rewards.append(data['avg_reward'])
             total_episodes.append(data.get('episode_count', data['episode'] + 1))  # Handle legacy data
+            avg_repeats.append(data['avg_repeats'])
+    
+    # Convert to fraction of max_steps
+    repeated_frac = np.array(avg_repeats) / max_steps
     
     # Create single plot
     fig, ax = plt.subplots(figsize=(12, 6))
@@ -84,6 +92,13 @@ def plot_training_progress(output_dir: Path) -> None:
     
     # Plot training ratio
     ax.plot(episodes, training_ratios, label='Training Ratio', color='green', linestyle=':')
+    
+    # Plot repeated actions as a fraction of max_steps
+    ax.plot(episodes, repeated_frac, 
+            label='Repeated Actions (frac)', 
+            color='purple', 
+            linestyle='--',
+            alpha=0.7)
     
     # Configure labels and legend
     ax.set_xlabel("Episode")

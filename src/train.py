@@ -21,6 +21,8 @@ from curriculum import (
 from plot_training import plot_training_progress
 from plot_trajectories import plot_trajectory_rewards
 
+from peft import LoraConfig, get_peft_model
+
 class TrajectoryEncoder(json.JSONEncoder):
     """Custom JSON encoder for Trajectory objects."""
     def default(self, obj):
@@ -85,6 +87,8 @@ def main():
                         help='Batch size for inference (trajectory generation)')
     parser.add_argument('--training-batch-size', type=int, default=8,
                         help='Batch size for training updates (number of successful trajectories per gradient step)')
+    parser.add_argument('--test-same-formula', action='store_true',
+                       help='Use the same formula for all episodes (testing mode)')
 
     args = parser.parse_args()
     
@@ -93,12 +97,40 @@ def main():
         print(f"[INFO] Using default of {args.num_episodes} episodes "
               f"(number of unique {args.gen_mode} formulas for {args.num_vars} variables).")
     
+    if args.test_same_formula:
+        print("[TEST MODE] Using same formula for all episodes")
+        test_formula = generate_boolean_function(
+            num_vars=args.num_vars,
+            gen_mode=args.gen_mode
+        )
+    
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     output_dir = Path(f'runs/{timestamp}')
     output_dir.mkdir(parents=True, exist_ok=True)
     
     with open(output_dir / 'config.json', 'w') as f:
-        json.dump(vars(args), f, indent=2)
+        config = vars(args)
+        # Determine target modules based on model type
+        if "gpt2" in args.model_name.lower():
+            target_modules = ["c_attn", "c_proj"]  # GPT-2 attention projections
+        elif "llama" in args.model_name.lower():
+            target_modules = ["q_proj", "v_proj"]  # LLaMA's separate query/value
+        else:
+            target_modules = ["q_proj", "v_proj"]  # Default to LLaMA-style
+
+        lora_config = LoraConfig(
+            r=8,
+            lora_alpha=32,
+            lora_dropout=0.1,
+            target_modules=target_modules,
+            task_type="CAUSAL_LM"
+        )
+
+        # Update config logging
+        config.update({
+            "lora_target_modules": target_modules,
+        })
+        json.dump(config, f, indent=2)
     
     actor_model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16)
     critic_model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16)
@@ -106,6 +138,9 @@ def main():
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     actor_model.to(device)
+    # Apply LoRA to actor model only
+    actor_model = get_peft_model(actor_model, lora_config)
+    actor_model.print_trainable_parameters()
     critic_model.to(device)
     
     trainer = ExpertIterationTrainer(
@@ -129,10 +164,13 @@ def main():
     batch_trajectories = []   # List to accumulate trajectories for batched training.
     
     for episode in range(args.num_episodes-1):
-        formula = generate_boolean_function(
-            num_vars=args.num_vars,
-            gen_mode=args.gen_mode
-        )
+        if args.test_same_formula:
+            formula = test_formula
+        else:
+            formula = generate_boolean_function(
+                num_vars=args.num_vars,
+                gen_mode=args.gen_mode
+            )
         
         # Use inference batch size for trajectory generation.
         trajectories = trainer.generate_trajectories_batch(formula, batch_size=args.inference_batch_size, max_steps=2**args.num_vars)
@@ -194,7 +232,8 @@ def main():
                 "std": float(trainer.stats.std),
                 "training_threshold": float(trainer.stats.mean + trainer.sd_factor * trainer.stats.std),
                 "training_ratio": len(successful_batch)/len(trajectories) if trajectories else 0.0,
-                "total_episodes": episode_count
+                "total_episodes": episode_count,
+                "avg_repeats": float(np.mean(local_repeats)) if local_repeats else 0.0,
             }, f)
             f.write('\n')
 

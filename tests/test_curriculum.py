@@ -3,26 +3,26 @@ import torch
 from copy import deepcopy
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import re
-import random
- 
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
+import math
+import logging
 
 from src.curriculum import (
-    BooleanFormula,  # legacy interface (not used for training)
     RandomTableFormula,
     LinearFormula,
     generate_boolean_function,
     generate_all_assignments,
-    generate_trajectory,
     format_trajectory_prompt,
     encode_assignment,
     decode_assignment,
     enumerative_policy,
     model_policy,
-    constant_reward,
-    model_reward,
     ExpertIterationTrainer,
     Trajectory,
-    RunningStats,
+    batched_random_unique_policy,
+    generate_trajectories_batch,
 )
 
 # ------------------------------------------------------------------
@@ -61,6 +61,19 @@ def test_generate_boolean_function():
     formula_linear = generate_boolean_function(num_vars=2, gen_mode="linear")
     from src.curriculum import LinearFormula
     assert isinstance(formula_linear, LinearFormula)
+
+def test_dummy_formula_evaluation():
+    class DummyFormula:
+        def __init__(self, num_vars):
+            self.num_vars = num_vars
+        def evaluate(self, assignment):
+            # For testing, simply return True if an even number of True, else False.
+            return sum(assignment) % 2 == 0
+
+    num_vars = 3
+    dummy = DummyFormula(num_vars)
+    assert dummy.evaluate([True, False, True]) == True  # 2 True's -> even -> True
+    assert dummy.evaluate([True, False, False]) == False  # 1 True -> odd -> False
 
 # ------------------------------------------------------------------
 # Tests for Generating Assignments and Formatting
@@ -668,3 +681,196 @@ def test_training_batch_size():
     # Test training
     #try:
     trainer.train_on_trajectories(trajectories)
+
+def test_repeated_training_same_formula():
+    """Test that training on the same formula multiple times improves performance."""
+    model = AutoModelForCausalLM.from_pretrained("gpt2")
+    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    tokenizer.pad_token = tokenizer.eos_token
+    num_vars = 4
+    trainer = ExpertIterationTrainer(
+        actor_model=model,
+        critic_model=model,
+        tokenizer=tokenizer,
+        num_vars=num_vars,
+        sd_factor=1.0,
+        lr=1e-3
+    )
+    
+    # Configure batch sizes and print interval
+    training_batch_size = 64
+    inference_batch_size = 128
+    print_interval = 10
+    
+    # Create a simple linear formula
+    formula = LinearFormula(num_vars=num_vars)
+    initial_rewards = []
+    final_rewards = []
+    
+    # Train for 20 episodes on the same formula
+    num_episodes = 100 
+    for episode in range(num_episodes):
+        # Generate trajectories with inference batch size
+        trajectories = trainer.generate_trajectories_batch(formula, batch_size=inference_batch_size, max_steps=2**num_vars)
+        # Compute rewards and update stats
+        rewards_tensor = trainer.batched_model_reward(trajectories)
+        for i, traj in enumerate(trajectories):
+            traj.avg_reward = rewards_tensor[i].mean().item()
+            traj.successful = traj.avg_reward >= (trainer.stats.mean + trainer.sd_factor * trainer.stats.std)
+            trainer.update_stats(traj.avg_reward)
+        
+        # Accumulate successful trajectories
+        successful_trajs = [traj for traj in trajectories if traj.successful]
+        while len(successful_trajs) >= training_batch_size:
+            trainer.train_on_trajectories(successful_trajs[:training_batch_size])
+            successful_trajs = successful_trajs[training_batch_size:]
+        
+        # Track initial and final rewards
+        if episode == 0:
+            initial_rewards.extend([t.avg_reward for t in trajectories])
+        if episode == num_episodes - 1:
+            final_rewards.extend([t.avg_reward for t in trajectories])
+        
+        # Simulate print interval
+        if episode % print_interval == 0:
+            print(f"Episode {episode} - Avg Reward: {np.mean([t.avg_reward for t in trajectories]):.3f}")
+    
+    # Verify performance improves
+    assert np.mean(final_rewards) > np.mean(initial_rewards), (
+        "Final rewards should be higher than initial rewards"
+    )
+    
+    # Verify training ratio increases as model learns
+    training_ratios = [r for r in trainer.stats.get_history()['training_ratio'] if r is not None]
+    assert np.mean(training_ratios[-3:]) > np.mean(training_ratios[:3]), (
+        "Later training ratios should be higher than initial ones"
+    )
+
+def test_random_policy_reward_distribution():
+    """Verify random policy produces diverse rewards and visualize trajectories."""
+    # Set model type: "gpt2" or "llama"
+    model_name = "llama"  # Change to "llama" for Meta-Llama model.
+    if model_name.lower() == "llama":
+        model_id = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+        num_trajectories = 500
+        reward_compute_batch_size = 64
+    else:
+        model_id = model_name
+        num_trajectories = 10000
+        reward_compute_batch_size = 500
+
+    num_vars = 6
+    max_steps = 2 ** num_vars
+    
+    # Initialize model components
+    model = AutoModelForCausalLM.from_pretrained(model_id)
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    tokenizer.pad_token = tokenizer.eos_token
+    trainer = ExpertIterationTrainer(
+        actor_model=model,
+        critic_model=model,
+        tokenizer=tokenizer,
+        num_vars=num_vars,
+        device=torch.device("cuda")
+    )
+    
+    # Create simple linear formula
+    formula = LinearFormula(num_vars=num_vars)
+    
+    # Generate trajectories using the batched version of our random unique policy.
+    batched_policy = batched_random_unique_policy(num_vars, num_trajectories)
+    trajectories = generate_trajectories_batch(
+        formula,
+        batch_size=num_trajectories,
+        max_steps=max_steps,
+        batched_policy=batched_policy
+    )
+    
+    # Calculate rewards using batched model reward in smaller mini-batches to reduce memory usage.
+    for i in range(0, len(trajectories), reward_compute_batch_size):
+        batch = trajectories[i:i+reward_compute_batch_size]
+        rewards_tensor = trainer.batched_model_reward(batch)
+        for traj, rewards in zip(batch, rewards_tensor):
+            traj.rewards = rewards.tolist()
+            traj.avg_reward = rewards.mean().item()
+    
+    # Create plot of quintile averages (pointwise)
+    plt.figure(figsize=(12, 6))
+
+    # Sort trajectories by avg_reward
+    sorted_trajs = sorted(trajectories, key=lambda t: t.avg_reward)
+    n = len(sorted_trajs)
+    quintile_size = math.ceil(n / 5)
+
+    # For each quintile, compute the pointwise mean of rewards:
+    for i in range(5):
+        group = sorted_trajs[i*quintile_size : (i+1)*quintile_size]
+        if len(group) == 0:
+            continue
+        # Assumes all trajectories have the same number of steps.
+        rewards_matrix = np.array([traj.rewards for traj in group])
+        avg_rewards = rewards_matrix.mean(axis=0)
+        steps = np.arange(len(avg_rewards))
+        plt.plot(steps, avg_rewards, label=f"Quintile {i+1} (n={len(group)})", linewidth=2)
+
+    plt.xlabel("Step in Trajectory")
+    plt.ylabel("Instant Reward")
+    plt.title(f"Random Policy Reward Distribution (Pointwise Quintile Averages, {num_trajectories} trajectories)")
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.grid(True)
+
+    # Compute and plot the optimal policy by averaging over multiple formulas.
+    # Instead of generating several optimal trajectories for the same formula,
+    # we generate a new formula for each trial.
+    num_optimal_trials = 30
+    optimal_trajs = []
+    for _ in range(num_optimal_trials):
+         # Generate a new formula instance (this could also be random if desired)
+         new_formula = LinearFormula(num_vars=num_vars)
+         optimal_trajs.append(trainer.optimal_trajectory(new_formula, num_vars))
+    optimal_rewards_tensor = trainer.batched_model_reward(optimal_trajs)
+    optimal_rewards_avg = optimal_rewards_tensor.mean(dim=0).tolist()
+    steps_opt = np.arange(len(optimal_rewards_avg))
+    plt.plot(steps_opt, optimal_rewards_avg, label="Optimal Policy (avg over formulas)", 
+             linewidth=3, linestyle='--', marker='o', color='black')
+
+    plot_path = "random_policy_rewards.png"
+    plt.savefig(plot_path, bbox_inches='tight')
+    plt.close()
+
+def test_batched_random_unique_policy_output():
+    from src.curriculum import batched_random_unique_policy, Trajectory
+    num_vars = 3
+    batch_size = 5
+    batched_policy = batched_random_unique_policy(num_vars, batch_size)
+    # Create a batch of empty trajectories:
+    trajectories = [Trajectory(observations=[], actions=[], rewards=None) for _ in range(batch_size)]
+    actions_batch = batched_policy(trajectories)
+    assert len(actions_batch) == batch_size
+    for action in actions_batch:
+        assert isinstance(action, list)
+        assert len(action) == num_vars
+
+def test_generate_trajectories_batch():
+    from src.curriculum import generate_trajectories_batch, batched_random_unique_policy
+    # Use a very simple dummy formula for testing.
+    class DummyFormula:
+        def __init__(self, num_vars):
+            self.num_vars = num_vars
+            self.a = [None] * num_vars  # Dummy attribute for compatibility
+        def evaluate(self, assignment):
+            # Return True if at least one True present
+            return any(assignment)
+    num_vars = 3
+    batch_size = 4
+    max_steps = 7
+    formula = DummyFormula(num_vars)
+    batched_policy = batched_random_unique_policy(num_vars, batch_size)
+    trajectories = generate_trajectories_batch(formula, batch_size, max_steps, batched_policy)
+    assert len(trajectories) == batch_size
+    for traj in trajectories:
+        assert len(traj.actions) == max_steps
+        assert len(traj.observations) == max_steps
+        # Verify that the observation equals what DummyFormula.evaluate would produce.
+        for action, obs in zip(traj.actions, traj.observations):
+            assert obs == any(action)

@@ -194,6 +194,30 @@ def enumerative_policy(num_vars: int) -> Callable[[Optional[Trajectory]], Dict[s
     return policy
 
 
+def random_unique_policy(num_vars: int) -> Callable[[Optional[Trajectory]], List[bool]]:
+    """Policy that generates all possible assignments in random order without repeats."""
+    # Generate and shuffle all possible assignments
+    assignments = []
+    for i in range(2 ** num_vars):
+        assignment = []
+        for j in range(num_vars):
+            assignment.append(bool((i >> j) & 1))
+        assignments.append(assignment)
+    random.shuffle(assignments)
+    
+    current_idx = 0
+    
+    def policy(trajectory: Optional[Trajectory] = None) -> List[bool]:
+        nonlocal current_idx
+        if current_idx >= len(assignments):
+            raise ValueError("Policy has exhausted all possible assignments")
+        assignment = assignments[current_idx]
+        current_idx += 1
+        return assignment
+    
+    return policy
+
+
 def model_policy(
     model: PreTrainedModel, tokenizer: PreTrainedTokenizer, num_vars: int, temperature: float = 1.5
 ) -> PolicyType:
@@ -212,121 +236,6 @@ RewardFunction = Callable[[Trajectory], List[float]]
 def constant_reward(_: Trajectory) -> float:
     """Always returns 1.0 as the reward."""
     return 1.0
-
-
-def model_reward(
-    model: PreTrainedModel,
-    tokenizer: PreTrainedTokenizer,
-) -> RewardFunction:
-    """
-    Create reward function that calculates reward based on model's prediction accuracy.
-    Returns probability of correct result at each step.
-    """
-    def reward_fn(trajectory: Trajectory) -> List[float]:
-        # Format full trajectory
-        input_text = format_trajectory_prompt(trajectory)
-        tokens = tokenizer.encode(input_text)
-        input_ids = torch.tensor(tokens).unsqueeze(0)
-        
-        # Get model predictions
-        input_ids = input_ids.to(model.device)
-        with torch.no_grad():
-            outputs = model(input_ids=input_ids)
-            logits = outputs.logits
-        
-        # NEW: Dynamically obtain arrow token id instead of hardcoded 4613.
-        # note the leading space i n " ->"
-        arrow_token_ids = tokenizer.encode(" ->", add_special_tokens=False)
-        if len(arrow_token_ids) != 1:
-            print("Warning: Tokenization for ' ->' did not result in a single token:", arrow_token_ids)
-        arrow_token = arrow_token_ids[0]
-        arrow_positions = [i for i, t in enumerate(tokens) if t == arrow_token]
-        
-        # Calculate reward for each step
-        rewards = []
-        true_token = tokenizer.encode("True", add_special_tokens=False)[0]
-        false_token = tokenizer.encode("False", add_special_tokens=False)[0]
-        
-        for pos, result in zip(arrow_positions, trajectory.observations):
-            next_token_logits = logits[0, pos]
-            true_false_logits = next_token_logits[[true_token, false_token]]
-            logit_T = true_false_logits[0]
-            logit_F = true_false_logits[1]
-            max_logit = max(logit_T, logit_F)
-            exp_T = torch.exp(logit_T - max_logit)
-            exp_F = torch.exp(logit_F - max_logit)
-            p_T = exp_T / (exp_T + exp_F)
-            p_F = exp_F / (exp_T + exp_F)
-            prob_correct = p_T if result else p_F
-            rewards.append(prob_correct.item())
-        
-        return rewards
-    return reward_fn
-
-
-def generate_trajectory(
-    formula: BooleanFormula,
-    policy: Callable[[Optional[Trajectory]], List[bool]],
-    max_steps: Optional[int] = None,
-    gen_mode: str = "random",
-) -> Trajectory:
-    """
-    Generate a trajectory by repeatedly applying policy and evaluating formula.
-    For linear formulas, replace duplicate actions with random unused ones.
-    For random formulas, skip duplicates and continue.
-    """
-    observations = []
-    actions = []
-    seen_actions = set()
-    repeated_count = 0
-
-    # For linear formulas, maintain a set of unused assignments
-    unused_assignments = None
-    if gen_mode == "linear":
-        # Generate all possible assignments if we're in linear mode
-        all_assignments = []
-        for i in range(2 ** len(formula.a)):  # formula.a length is num_vars
-            assignment = []
-            for j in range(len(formula.a)):
-                assignment.append(bool((i >> j) & 1))
-            all_assignments.append(tuple(assignment))
-        unused_assignments = set(all_assignments)
-
-    while True:
-        current_trajectory = Trajectory(
-            observations=observations,
-            actions=actions,
-            rewards=None
-        )
-        
-        action = policy(current_trajectory)
-        action_tuple = tuple(action)
-
-        if action_tuple in seen_actions:
-            #print("duplicate", action_tuple)
-            repeated_count += 1
-            if gen_mode == "linear" and unused_assignments:
-                # Replace duplicate with random unused assignment
-                action_tuple = random.choice(tuple(unused_assignments))
-                action = list(action_tuple)
-            else:
-                # For random formulas or if no unused assignments left
-                continue
-
-        seen_actions.add(action_tuple)
-        if gen_mode == "linear" and unused_assignments is not None:
-            unused_assignments.discard(action_tuple)
-
-        result = formula.evaluate(action)
-        actions.append(action)
-        observations.append(result)
-        
-        if max_steps is not None and len(actions) >= max_steps:
-            break
-            
-    traj = Trajectory(observations=observations, actions=actions, rewards=None)
-    setattr(traj, "repeated_count", repeated_count)
-    return traj
 
 
 def format_trajectory_prompt(trajectory: Trajectory) -> str:
@@ -508,8 +417,9 @@ class ExpertIterationTrainer:
         num_vars: int,
         device: torch.device = torch.device("cuda"),
         sd_factor: float = 1.0,
-        temperature: float = 1.5,
-        lr: float = 3e-4,
+        temperature: float = 1.0,
+        lr: float = 1e-3,
+        
     ):
         self.actor_model = actor_model
         self.critic_model = critic_model
@@ -533,40 +443,11 @@ class ExpertIterationTrainer:
 
         self.stats = RunningStats()
         self.optimizer = Adam8bit(self.actor_model.parameters(), lr=lr)
-        self.reward_fn = model_reward(self.critic_model, self.tokenizer)
+        self.reward_fn = self.batched_model_reward
 
     def update_stats(self, reward: float):
         """Update running statistics with new reward."""
         self.stats.update(reward)
-
-    def train_on_trajectory(self, trajectory: Trajectory) -> None:
-        # Format the full trajectory prompt (includes both proposals and critic answers)
-        full_prompt = format_trajectory_prompt(trajectory)
-        print("Training on full prompt (with masked answer tokens):")
-        if self.current_formula is not None:
-            print(f"Formula: {self.current_formula}")
-        print(full_prompt)
-        tokens = self.tokenizer.encode(full_prompt)
-        input_ids = torch.tensor(tokens, device=self.device).unsqueeze(0)
-        labels = list(tokens)
-        arrow_token_ids = self.tokenizer.encode(" ->", add_special_tokens=False)
-        if len(arrow_token_ids) != 1:
-            print("Warning: Unexpected tokenization for ' ->':", arrow_token_ids)
-        arrow_token = arrow_token_ids[0]
-        i = 0
-        while i < len(labels):
-            if input_ids[0][i] == arrow_token or input_ids[0][i-1] == arrow_token:
-                labels[i] = -100
-            i += 1
-        labels = torch.tensor(labels, device=self.device).unsqueeze(0)
-        self.optimizer.zero_grad()
-        outputs = self.actor_model(
-            input_ids=input_ids,
-            labels=labels,
-        )
-        loss = outputs.loss * ((np.mean(trajectory.rewards) - self.stats.mean) / self.stats.std)
-        loss.backward()
-        self.optimizer.step()
 
     def train_on_trajectories(self, trajectories: list[Trajectory]) -> None:
         """
@@ -590,18 +471,28 @@ class ExpertIterationTrainer:
         # Get arrow token ID
         arrow_token = self.tokenizer.encode(" ->", add_special_tokens=False)[0]
         
+        # Get structural token IDs
+        bracket_open = self.tokenizer.encode("[", add_special_tokens=False)[0]
+        bracket_close = self.tokenizer.encode("]", add_special_tokens=False)[0]
+        comma = self.tokenizer.encode(",", add_special_tokens=False)[0]
+        newline = self.tokenizer.encode("\n", add_special_tokens=False)[0]
+        structural_tokens = {bracket_open, bracket_close, comma, arrow_token, newline}
+        
         # Create labels with shifted input_ids for autoregressive training
         labels = input_ids.clone()
         
-        # Mask arrow tokens and their following values in all batch elements
+        # Mask structural tokens and arrow answers
         for batch_idx in range(input_ids.size(0)):
-            # Iterate through each token position
             for pos in range(input_ids.size(1)):
-                if input_ids[batch_idx, pos] == arrow_token:
-                    # Mask the arrow token and next token (if exists)
+                token = input_ids[batch_idx, pos].item()
+                
+                # Mask structural tokens and arrow answers
+                if token in structural_tokens:
                     labels[batch_idx, pos] = -100
-                    if pos + 1 < input_ids.size(1):
-                        labels[batch_idx, pos + 1] = -100
+                    
+                # Special handling for arrow token's answer
+                if token == arrow_token and (pos + 1) < input_ids.size(1):
+                    labels[batch_idx, pos + 1] = -100
 
         # For autoregressive training, labels should be shifted right
         labels = labels[:, 1:].contiguous()
@@ -625,6 +516,12 @@ class ExpertIterationTrainer:
         
         loss.backward()
         self.optimizer.step()
+
+        # Calculate rewards using batched method
+        rewards = self.batched_model_reward(trajectories)
+        for traj, traj_rewards in zip(trajectories, rewards):
+            traj.rewards = traj_rewards.tolist()
+            traj.avg_reward = traj_rewards.mean().item()
 
     def _finalize_assignment(self, generated_tokens: torch.Tensor, seen_actions: set, all_assignments: set) -> (list[bool], bool):
         """
@@ -818,47 +715,68 @@ class ExpertIterationTrainer:
                     rewards[i, j] = probs[i, j, 1]
         return rewards
 
-    def generate_and_train(
-        self, formula: BooleanFormula, max_steps: Optional[int] = None
-    ) -> Trajectory:
-        """Generate trajectory and potentially train on it."""
-        # Store current formula for printing in calculate_loss
-        self.current_formula = formula
+    def optimal_trajectory(self, formula: BooleanFormula, num_vars: int) -> Trajectory:
+        """
+        Generate the "optimal" trajectory based on the optimal assignment strategy described in the README,
+        then, if desired, extend it with random unique actions.
         
-        # Create policy with the configured temperature
-        policy = model_policy(self.actor_model, self.tokenizer, self.num_vars, temperature=self.temperature)
+        The optimal part consists of:
+          1. First assignment: all False.
+          2. Then, sequentially set the i-th variable to True.
+         This yields num_vars+1 assignments.
+         
+        If max_steps is provided and is greater than num_vars+1, the trajectory is extended by filling
+        with randomly selected unique assignments (i.e. assignments not already in the optimal part).
         
-        # Generate trajectory
-        trajectory = generate_trajectory(
-            formula=formula,
-            policy=policy,
-            max_steps=max_steps,
-            gen_mode=formula.__class__.__name__.replace("Formula", "").lower()
-        )
+        Args:
+            formula: A BooleanFormula used to evaluate assignments.
+            num_vars: Number of variables in the formula.
+            max_steps: Optional total number of steps in the trajectory. If provided and greater than num_vars+1,
+                       the trajectory is extended.
         
-        # Calculate rewards
-        rewards = self.reward_fn(trajectory)
-        trajectory.rewards = rewards
+        Returns:
+            Trajectory: The trajectory containing the optimal sequence of actions (extended if applicable)
+                        and the corresponding observations.
+        """
+        max_steps = 2**num_vars
+        # Create the base trajectory with optimal assignments.
+        traj = Trajectory(observations=[], actions=[], rewards=None)
+        optimal_actions = []
+        # Step 0: all False.
+        all_false = [False] * num_vars
+        optimal_actions.append(all_false)
+        # Steps 1..n: for each variable, create an assignment with that variable set to True.
+        for i in range(num_vars):
+            assignment = [False] * num_vars
+            assignment[i] = True
+            optimal_actions.append(assignment)
         
-        # Calculate average reward
-        avg_reward = sum(rewards) / len(rewards)
-        setattr(trajectory, "avg_reward", avg_reward)
-        setattr(trajectory, "was_trained", False)  # Default to False
-        # Store the threshold used for this trajectory, configurable now with sd_factor
-        threshold = self.stats.mean + self.sd_factor * self.stats.std
-        setattr(trajectory, "training_threshold", threshold)
+        # Append optimal assignments to trajectory.
+        for action in optimal_actions:
+            traj.actions.append(action)
+            traj.observations.append(formula.evaluate(action))
         
-        # Update statistics
-        previous_mean, previous_std = self.stats.mean, self.stats.std
-        self.update_stats(avg_reward)
-        
-        # Train if trajectory is good enough using the configurable threshold
-        if avg_reward >= previous_mean + self.sd_factor * previous_std:
-            self.train_on_trajectory(trajectory)
-            setattr(trajectory, "was_trained", True)
-            
-        return trajectory
-
+        # If max_steps is provided and there is room to add extra steps, extend with random unique actions.
+        if max_steps is not None and max_steps > len(optimal_actions):
+            remaining = max_steps - len(optimal_actions)
+            # Generate all possible assignments.
+            all_assignments = []
+            for i in range(2 ** num_vars):
+                assignment = []
+                for j in range(num_vars):
+                    assignment.append(bool((i >> j) & 1))
+                all_assignments.append(assignment)
+            # Exclude the assignments already in the optimal sequence.
+            optimal_set = {tuple(a) for a in optimal_actions}
+            available_assignments = [a for a in all_assignments if tuple(a) not in optimal_set]
+            # Shuffle the available assignments.
+            random.shuffle(available_assignments)
+            fill_count = min(remaining, len(available_assignments))
+            additional_actions = available_assignments[:fill_count]
+            for action in additional_actions:
+                traj.actions.append(action)
+                traj.observations.append(formula.evaluate(action))
+        return traj
 
 def log_trajectory(log_file: Path, trajectory: Trajectory, loss: Optional[float], formula: BooleanFormula):
     """Log trajectory data to jsonl file."""
@@ -875,3 +793,51 @@ def log_trajectory(log_file: Path, trajectory: Trajectory, loss: Optional[float]
     with open(log_file, 'a') as f:
         json.dump(data, f)
         f.write('\n')
+
+def batched_random_unique_policy(num_vars: int, batch_size: int) -> Callable[[List[Trajectory]], List[List[bool]]]:
+    """
+    Create a batched policy that, for each trajectory in the batch, uses a fresh random unique policy.
+    Returns a callable that, given a list of current trajectories, returns a list of assignments (one per trajectory).
+    """
+    # Create independent policy instances (one per trajectory).
+    policies = [random_unique_policy(num_vars) for _ in range(batch_size)]
+    
+    def batched_policy(trajectories: List[Trajectory]) -> List[List[bool]]:
+        actions = []
+        for p, traj in zip(policies, trajectories):
+            try:
+                action = p(traj)
+            except ValueError:
+                raise ValueError("One of the policies is exhausted")
+            actions.append(action)
+        return actions
+    
+    return batched_policy
+
+def generate_trajectories_batch(
+    formula: BooleanFormula,
+    batch_size: int,
+    max_steps: Optional[int],
+    batched_policy: Callable[[List[Trajectory]], List[List[bool]]]
+) -> List[Trajectory]:
+    """
+    Generate a batch of trajectories using the provided batched_policy.
+    The batched_policy is expected to generate a list of assignments (one for each trajectory)
+    given the list of current trajectories.
+    """
+    # Initialize a list of empty trajectories.
+    trajectories = [Trajectory(observations=[], actions=[], rewards=None) for _ in range(batch_size)]
+    steps = 0
+    while True:
+        try:
+            actions_batch = batched_policy(trajectories)
+        except ValueError:
+            break
+        for traj, action in zip(trajectories, actions_batch):
+            result = formula.evaluate(action)
+            traj.actions.append(action)
+            traj.observations.append(result)
+        steps += 1
+        if max_steps is not None and steps >= max_steps:
+            break
+    return trajectories
