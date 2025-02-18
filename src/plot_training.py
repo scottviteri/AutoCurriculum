@@ -30,80 +30,72 @@ def get_default_window_size(num_vars: int) -> int:
     else:
         return 1
 
-def plot_training_progress(output_dir: Path):
-    """Plot training progress from stats.jsonl file."""
+def plot_training_progress(output_dir: Path) -> None:
+    """Plot training progress from stats.jsonl."""
     stats_file = output_dir / 'stats.jsonl'
-    trajectories_file = output_dir / 'trajectories.jsonl'
+    if not stats_file.exists():
+        return
     
-    # Read data from stats.jsonl (one record per main loop iteration)
+    # Read config to get sd_factor
+    config_file = output_dir / 'config.json'
+    sd_factor = 1.0
+    if config_file.exists():
+        with open(config_file) as f:
+            config = json.load(f)
+        sd_factor = config.get('sd_factor', 1.0)
+    
     episodes = []
+    means = []
+    stds = []
     thresholds = []
-    rewards = []
+    training_ratios = []
+    normalized_rewards = []
+    avg_rewards = []
+    total_episodes = []
+    
     with open(stats_file) as f:
         for line in f:
             data = json.loads(line)
             episodes.append(data['episode'])
-            rewards.append(data['avg_reward'])
-            thresholds.append(data['threshold'])
-
-    # Read batch_size from config.json (if available) instead of CLI args.
-    config_path = output_dir / 'config.json'
-    batch_size = None
-    if config_path.exists():
-        with open(config_path, 'r') as f:
-            config = json.load(f)
-        batch_size = config.get('batch_size', None)
-    if batch_size is not None and len(episodes) > 0:
-        grouped_eps = []
-        grouped_thresh = []
-        grouped_rewards = []
-        # Group every batch_size episodes together by taking the mean.
-        for i in range(0, len(episodes), batch_size):
-            batch_eps = episodes[i:i+batch_size]
-            batch_thresh = thresholds[i:i+batch_size]
-            batch_rewards = rewards[i:i+batch_size]
-            grouped_eps.append(np.mean(batch_eps) if len(batch_eps) > 0 else 0)
-            grouped_thresh.append(np.mean(batch_thresh) if len(batch_thresh) > 0 else 0)
-            grouped_rewards.append(np.mean(batch_rewards) if len(batch_rewards) > 0 else 0)
-        episodes = grouped_eps
-        thresholds = grouped_thresh
-        rewards = grouped_rewards
-
-    # Create figure with two subplots
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 10))
+            means.append(data['mean'])
+            stds.append(data['std'])
+            thresholds.append(data['training_threshold'])
+            training_ratios.append(data['training_ratio'])
+            normalized_rewards.append(data['normalized_reward'])
+            avg_rewards.append(data['avg_reward'])
+            total_episodes.append(data.get('episode_count', data['episode'] + 1))  # Handle legacy data
     
-    # Plot rewards and threshold
-    ax1.plot(episodes, rewards, label='Average Reward')
-    ax1.plot(episodes, thresholds, label='Training Threshold', linestyle='--')
-    ax1.set_xlabel('Episode')
-    ax1.set_ylabel('Reward')
-    ax1.set_title('Training Progress')
-    ax1.legend()
-    ax1.grid(True)
+    # Create single plot
+    fig, ax = plt.subplots(figsize=(12, 6))
     
-    # Plot training vs non-training rewards
-    trained_rewards = []
-    untrained_rewards = []
-    with open(trajectories_file) as f:
-        for line in f:
-            data = json.loads(line)
-            if data['was_trained']:
-                trained_rewards.append(data['avg_reward'])
-            else:
-                untrained_rewards.append(data['avg_reward'])
+    # Normalize rewards to 0-1 scale (assuming rewards are already in this range)
+    ax.set_ylim(0, 1)
     
-    if trained_rewards:
-        ax2.hist(trained_rewards, alpha=0.5, label='Trained', bins=20)
-    if untrained_rewards:
-        ax2.hist(untrained_rewards, alpha=0.5, label='Not Trained', bins=20)
-    ax2.set_xlabel('Reward')
-    ax2.set_ylabel('Count')
-    ax2.set_title('Distribution of Rewards')
-    ax2.legend()
+    # Plot actual episode averages
+    ax.plot(episodes, avg_rewards, label='Episode Rewards', color='blue')
+    ax.fill_between(
+        episodes,
+        np.array(avg_rewards) - np.array(stds)*sd_factor,
+        np.array(avg_rewards) + np.array(stds)*sd_factor,
+        alpha=0.2,
+        color='blue',
+        label=f'±{sd_factor}σ Range'
+    )
+    
+    # Plot training ratio
+    ax.plot(episodes, training_ratios, label='Training Ratio', color='green', linestyle=':')
+    
+    # Configure labels and legend
+    ax.set_xlabel("Episode")
+    ax.set_ylabel("Value (0-1 Scale)")
+    ax.set_title("Training Progress")
+    ax.legend(loc='upper left', bbox_to_anchor=(1.05, 1))
+    ax.grid(True)
+    
     
     plt.tight_layout()
     plt.savefig(output_dir / 'training_progress.png')
-    plt.close()
+    plt.close(fig)
 
 def find_latest_run(runs_dir: Path) -> Path:
     """Find the most recent run directory based on timestamp."""
@@ -131,7 +123,7 @@ def main():
         print(f"Plotting most recent run: {run_dir}")
     
     try:
-        plot_training_progress(run_dir, window_size=args.window_size)
+        plot_training_progress(run_dir)
         print(f"Plot saved to {run_dir}/training_progress.png")
     except Exception as e:
         print(f"Error creating plot: {e}")

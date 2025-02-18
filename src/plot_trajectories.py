@@ -10,7 +10,7 @@ def group_trajectories(trajectories: List[Dict], batch_size: int) -> List[Dict]:
     """
     Group consecutive trajectories in groups of size batch_size.
     For each group, average the rewards element‐wise (padding shorter lists if needed)
-    and set was_trained True if any trajectory in the group was trained.
+    and set successful True if any trajectory in the group was successful.
     """
     grouped = []
     for i in range(0, len(trajectories), batch_size):
@@ -27,9 +27,9 @@ def group_trajectories(trajectories: List[Dict], batch_size: int) -> List[Dict]:
                 r = r + [r[-1]] * (max_len - len(r))
             padded.append(r)
         averaged = np.mean(padded, axis=0).tolist()
-        # Mark group as trained if any member was trained.
-        was_trained = any(traj['was_trained'] for traj in group)
-        grouped.append({'rewards': averaged, 'was_trained': was_trained})
+        # Mark group as successful if any member was successful.
+        successful = any(traj['successful'] for traj in group)
+        grouped.append({'rewards': averaged, 'successful': successful})
     return grouped
 
 def plot_trajectory_rewards(output_dir: Path, num_bins: int = 5):
@@ -43,7 +43,7 @@ def plot_trajectory_rewards(output_dir: Path, num_bins: int = 5):
             if data['trajectory'].get('rewards'):  # Only include trajectories with rewards
                 trajectories.append({
                     'rewards': data['trajectory']['rewards'],
-                    'was_trained': data['was_trained']
+                    'successful': data['successful']
                 })
     
     if not trajectories:
@@ -70,9 +70,9 @@ def plot_trajectory_rewards(output_dir: Path, num_bins: int = 5):
     if batch_size is not None:
         trajectories = group_trajectories(trajectories, batch_size)
 
-    # Split trajectories into bins based on trained trajectories.
-    trained_trajectories = [t for t in trajectories if t['was_trained']]
-    bin_size = max(1, len(trained_trajectories) // num_bins)
+    # Split trajectories into bins based on successful trajectories.
+    successful_trajectories = [t for t in trajectories if t['successful']]
+    bin_size = max(1, len(successful_trajectories) // num_bins)
     
     # Create figure
     plt.figure(figsize=(10, 6))
@@ -80,11 +80,11 @@ def plot_trajectory_rewards(output_dir: Path, num_bins: int = 5):
     # Plot average rewards for each bin
     for bin_idx in range(num_bins):
         start_idx = bin_idx * bin_size
-        end_idx = min(start_idx + bin_size, len(trained_trajectories))
-        if start_idx >= len(trained_trajectories):
+        end_idx = min(start_idx + bin_size, len(successful_trajectories))
+        if start_idx >= len(successful_trajectories):
             break
             
-        bin_trajectories = trained_trajectories[start_idx:end_idx]
+        bin_trajectories = successful_trajectories[start_idx:end_idx]
         
         # Find max length and pad shorter trajectories
         max_len = max(len(t['rewards']) for t in bin_trajectories)

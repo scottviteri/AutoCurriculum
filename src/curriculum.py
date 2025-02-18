@@ -10,6 +10,7 @@ from datetime import datetime
 import json
 import math
 from bitsandbytes.optim import Adam8bit
+import numpy as np
 
 OperatorType = Literal["AND", "OR", "NOT", "VAR"]
 
@@ -336,7 +337,7 @@ def format_trajectory_prompt(trajectory: Trajectory) -> str:
     lines = []
     for action, obs in zip(trajectory.actions, trajectory.observations):
         # Convert action to compact string like "[T,F,T,F]"
-        action_str = "[" + ",".join("T" if b else "F" for b in action) + "]"
+        action_str = "[" + ",".join("True" if b else "False" for b in action) + "]"
         line = f"{action_str} -> {obs}"
         lines.append(line)
 
@@ -505,9 +506,10 @@ class ExpertIterationTrainer:
         critic_model: PreTrainedModel,
         tokenizer: PreTrainedTokenizer,
         num_vars: int,
-        device: torch.device = torch.device("cpu"),
+        device: torch.device = torch.device("cuda"),
         sd_factor: float = 1.0,
         temperature: float = 1.5,
+        lr: float = 3e-4,
     ):
         self.actor_model = actor_model
         self.critic_model = critic_model
@@ -519,6 +521,7 @@ class ExpertIterationTrainer:
         self.device = device
         self.sd_factor = sd_factor
         self.temperature = temperature
+        self.lr = lr
 
         # Ensure models are on the correct device
         self.actor_model.to(self.device)
@@ -529,7 +532,7 @@ class ExpertIterationTrainer:
             param.requires_grad = False
 
         self.stats = RunningStats()
-        self.optimizer = Adam8bit(self.actor_model.parameters(), lr=1e-4)
+        self.optimizer = Adam8bit(self.actor_model.parameters(), lr=lr)
         self.reward_fn = model_reward(self.critic_model, self.tokenizer)
 
     def update_stats(self, reward: float):
@@ -552,20 +555,16 @@ class ExpertIterationTrainer:
         arrow_token = arrow_token_ids[0]
         i = 0
         while i < len(labels):
-            if labels[i] == arrow_token:
+            if input_ids[0][i] == arrow_token or input_ids[0][i-1] == arrow_token:
                 labels[i] = -100
-                if i + 1 < len(labels):
-                    labels[i+1] = -100
-                i += 2
-            else:
-                i += 1
+            i += 1
         labels = torch.tensor(labels, device=self.device).unsqueeze(0)
         self.optimizer.zero_grad()
         outputs = self.actor_model(
             input_ids=input_ids,
             labels=labels,
         )
-        loss = outputs.loss * torch.tensor(trajectory.rewards, device=self.device).mean()
+        loss = outputs.loss * ((np.mean(trajectory.rewards) - self.stats.mean) / self.stats.std)
         loss.backward()
         self.optimizer.step()
 
@@ -579,47 +578,51 @@ class ExpertIterationTrainer:
         3. Computes the loss from the batched forward pass, scales it by the average over all trajectories'
            average rewards, and steps the optimizer.
         """
-        # If no trajectories are provided, nothing to do.
         if not trajectories:
             return
 
-        import torch  # ensure torch is imported
-        # Create a list of full prompts.
+        # Tokenize all trajectories
         prompts = [format_trajectory_prompt(traj) for traj in trajectories]
         batch = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
         input_ids = batch["input_ids"].to(self.device)
         attention_mask = batch["attention_mask"].to(self.device)
         
-        # Build labels by taking a copy of input_ids and masking out tokens corresponding to the critic answers.
-        arrow_token_ids = self.tokenizer.encode(" ->", add_special_tokens=False)
-        if len(arrow_token_ids) != 1:
-            print("Warning: Unexpected tokenization for ' ->':", arrow_token_ids)
-        arrow_token = arrow_token_ids[0]
+        # Get arrow token ID
+        arrow_token = self.tokenizer.encode(" ->", add_special_tokens=False)[0]
         
-        # Create labels for each batch element.
-        batch_labels = []
-        input_ids_list = input_ids.tolist()  # list of token lists
-        for tokens in input_ids_list:
-            labels = tokens.copy()
-            i = 0
-            while i < len(labels):
-                if labels[i] == arrow_token:
-                    labels[i] = -100  # Mask the arrow token.
-                    if i + 1 < len(labels):
-                        labels[i+1] = -100  # Also mask the next token.
-                    i += 2
-                else:
-                    i += 1
-            batch_labels.append(labels)
-        batch_labels = torch.tensor(batch_labels, device=self.device)
+        # Create labels with shifted input_ids for autoregressive training
+        labels = input_ids.clone()
         
+        # Mask arrow tokens and their following values in all batch elements
+        for batch_idx in range(input_ids.size(0)):
+            # Iterate through each token position
+            for pos in range(input_ids.size(1)):
+                if input_ids[batch_idx, pos] == arrow_token:
+                    # Mask the arrow token and next token (if exists)
+                    labels[batch_idx, pos] = -100
+                    if pos + 1 < input_ids.size(1):
+                        labels[batch_idx, pos + 1] = -100
+
+        # For autoregressive training, labels should be shifted right
+        labels = labels[:, 1:].contiguous()
+        input_ids = input_ids[:, :-1].contiguous()
+        attention_mask = attention_mask[:, :-1].contiguous()
+
         self.optimizer.zero_grad()
-        outputs = self.actor_model(input_ids=input_ids, labels=batch_labels)
+        outputs = self.actor_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels
+        )
         
-        # Scale loss by the mean of the average rewards from each trajectory.
-        avg_rewards = torch.tensor([traj.avg_reward for traj in trajectories], device=self.device)
-        scale = avg_rewards.mean()
+        # Scale loss by normalized rewards
+        normalized_rewards = [
+            (traj.avg_reward - self.stats.mean) / self.stats.std 
+            for traj in trajectories
+        ]
+        scale = torch.tensor(np.mean(normalized_rewards), device=self.device).detach()
         loss = outputs.loss * scale
+        
         loss.backward()
         self.optimizer.step()
 
@@ -729,6 +732,8 @@ class ExpertIterationTrainer:
         trajectories = []
         for _ in range(batch_size):
             traj = Trajectory(actions=[], observations=[], rewards=None)
+            traj.avg_reward = 0.0                # Initialize average reward
+            traj.successful = False              # Initialize successful flag
             traj.seen_actions = set()
             traj.all_possible = set(tuple(a) for a in generate_all_assignments(self.num_vars))
             traj.repeated_count = 0

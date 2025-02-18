@@ -464,10 +464,7 @@ def test_batched_training_threshold_filtering():
     assert len(train_batch) == 2, "Expected 2 trajectories to pass the threshold"
 
     # Simulate training on the filtered batch.
-    try:
-        trainer.train_on_trajectories(train_batch)
-    except Exception as e:
-        pytest.skip("Training on batch not supported in dummy test setup.")
+    trainer.train_on_trajectories(train_batch)
     # For test purposes, mark those that were used for training.
     for traj in train_batch:
         traj.was_trained = True
@@ -599,3 +596,75 @@ def test_repeated_count_increases_on_duplicate():
     else:
         traj.repeated_count = initial_count
     assert traj.repeated_count == initial_count + 1, "Repeated count should increase on duplicate detection."
+
+def test_inference_batch_size():
+    """
+    Test that generate_trajectories_batch returns the expected number of trajectories
+    and initializes trajectory attributes properly.
+    """
+    num_vars = 4
+    model = AutoModelForCausalLM.from_pretrained("meta-llama/Meta-Llama-3.1-8B")
+    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3.1-8B")
+    tokenizer.pad_token = tokenizer.eos_token
+    trainer = ExpertIterationTrainer(
+        actor_model=model,
+        critic_model=model,
+        tokenizer=tokenizer,
+        num_vars=num_vars,
+        device=torch.device("cuda")
+    )
+    formula = generate_boolean_function(num_vars=num_vars, gen_mode="linear")
+    inference_batch_size = 5
+    max_steps = 2 ** num_vars  # For 2 variables, max_steps = 4
+    trajectories = trainer.generate_trajectories_batch(formula, batch_size=inference_batch_size, max_steps=max_steps)
+    assert len(trajectories) == inference_batch_size, (
+        f"Expected {inference_batch_size} trajectories, got {len(trajectories)}"
+    )
+
+def test_training_batch_size():
+    """Test batched training memory usage with Meta-Llama-3.1-8B"""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available, skipping memory test")
+
+    # Initialize model and trainer with conservative settings
+    num_vars = 4
+    model = AutoModelForCausalLM.from_pretrained(
+        "meta-llama/Meta-Llama-3.1-8B",
+        torch_dtype=torch.bfloat16,
+    ).to("cuda")
+    model.train()
+    for param in model.parameters():
+        param.requires_grad = True
+    
+    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3.1-8B")
+    tokenizer.pad_token = tokenizer.eos_token
+    
+    trainer = ExpertIterationTrainer(
+        actor_model=model,
+        critic_model=model,
+        tokenizer=tokenizer,
+        num_vars=num_vars,
+        device=torch.device("cuda"),
+        sd_factor=1.0
+    )
+
+    # Create template trajectory with UNMASKED tokens for training
+    template_traj = Trajectory(
+        # Valid assignment sequence that includes unmasked tokens
+        actions=[[True]*num_vars, [False]*num_vars],  # Simple pattern
+        observations=[True, False],
+        rewards=[0.9, 0.8]
+    )
+    # Add context that will contain unmasked tokens
+    template_traj.observations = [True, False] * 8  # 16 observations to match 2^4
+    template_traj.rewards = [0.8 + (i*0.01) for i in range(16)]
+    template_traj.avg_reward = sum(template_traj.rewards)/len(template_traj.rewards)
+    template_traj.successful = True
+    
+    # Create batch
+    batch_size = 2
+    trajectories = [deepcopy(template_traj) for _ in range(batch_size)]
+
+    # Test training
+    #try:
+    trainer.train_on_trajectories(trajectories)
