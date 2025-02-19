@@ -7,7 +7,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 import math
-import logging
 
 from src.curriculum import (
     RandomTableFormula,
@@ -751,9 +750,9 @@ def test_random_policy_reward_distribution():
     # Set model type: "gpt2" or "llama"
     model_name = "llama"  # Change to "llama" for Meta-Llama model.
     if model_name.lower() == "llama":
-        model_id = "meta-llama/Meta-Llama-3.1-8B-Instruct"
-        num_trajectories = 500
-        reward_compute_batch_size = 64
+        model_id = "meta-llama/Llama-3.3-70B-Instruct"
+        num_trajectories = 100 
+        reward_compute_batch_size = 4
     else:
         model_id = model_name
         num_trajectories = 10000
@@ -763,15 +762,14 @@ def test_random_policy_reward_distribution():
     max_steps = 2 ** num_vars
     
     # Initialize model components
-    model = AutoModelForCausalLM.from_pretrained(model_id)
+    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16, device_map="auto", offload_folder="offload")
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     tokenizer.pad_token = tokenizer.eos_token
     trainer = ExpertIterationTrainer(
         actor_model=model,
         critic_model=model,
         tokenizer=tokenizer,
-        num_vars=num_vars,
-        device=torch.device("cuda")
+        num_vars=num_vars
     )
     
     # Create simple linear formula
@@ -822,19 +820,25 @@ def test_random_policy_reward_distribution():
     # Compute and plot the optimal policy by averaging over multiple formulas.
     # Instead of generating several optimal trajectories for the same formula,
     # we generate a new formula for each trial.
-    num_optimal_trials = 30
+    num_optimal_trials = 32 
     optimal_trajs = []
     for _ in range(num_optimal_trials):
          # Generate a new formula instance (this could also be random if desired)
          new_formula = LinearFormula(num_vars=num_vars)
          optimal_trajs.append(trainer.optimal_trajectory(new_formula, num_vars))
-    optimal_rewards_tensor = trainer.batched_model_reward(optimal_trajs)
+    # Calculate rewards for the optimal trajectories in mini-batches using reward_compute_batch_size.
+    optimal_rewards_list = []
+    for i in range(0, len(optimal_trajs), reward_compute_batch_size):
+         batch = optimal_trajs[i:i+reward_compute_batch_size]
+         rewards_tensor = trainer.batched_model_reward(batch)
+         optimal_rewards_list.append(rewards_tensor)
+    optimal_rewards_tensor = torch.cat(optimal_rewards_list, dim=0)
     optimal_rewards_avg = optimal_rewards_tensor.mean(dim=0).tolist()
     steps_opt = np.arange(len(optimal_rewards_avg))
     plt.plot(steps_opt, optimal_rewards_avg, label="Optimal Policy (avg over formulas)", 
              linewidth=3, linestyle='--', marker='o', color='black')
 
-    plot_path = "random_policy_rewards.png"
+    plot_path = "random_policy_rewards_prompt.png"
     plt.savefig(plot_path, bbox_inches='tight')
     plt.close()
 

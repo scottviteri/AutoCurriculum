@@ -415,14 +415,14 @@ class ExpertIterationTrainer:
         critic_model: PreTrainedModel,
         tokenizer: PreTrainedTokenizer,
         num_vars: int,
-        device: torch.device = torch.device("cuda"),
+        device: torch.device = torch.device("cuda:0"),
         sd_factor: float = 1.0,
         temperature: float = 1.0,
         lr: float = 1e-3,
         
     ):
         self.actor_model = actor_model
-        self.critic_model = critic_model
+        self.critic_model = actor_model
         self.tokenizer = tokenizer
         # Ensure the tokenizer has a padding token.
         if self.tokenizer.pad_token is None:
@@ -433,9 +433,11 @@ class ExpertIterationTrainer:
         self.temperature = temperature
         self.lr = lr
 
-        # Ensure models are on the correct device
-        self.actor_model.to(self.device)
-        self.critic_model.to(self.device)
+        # Only move the model if it's not using offloading
+        if not self._is_offloaded(self.actor_model):
+            self.actor_model.to(self.device)
+        if not self._is_offloaded(self.critic_model):
+            self.critic_model.to(self.device)
 
         # Disable gradients for critic model
         for param in self.critic_model.parameters():
@@ -444,6 +446,14 @@ class ExpertIterationTrainer:
         self.stats = RunningStats()
         self.optimizer = Adam8bit(self.actor_model.parameters(), lr=lr)
         self.reward_fn = self.batched_model_reward
+
+    def _is_offloaded(self, model):
+        # This is a simple heuristic: offloaded models typically have parameters on device "meta".
+        # Adjust the logic as needed for your use-case.
+        for param in model.parameters():
+            if param.device.type == "meta":
+                return True
+        return False
 
     def update_stats(self, reward: float):
         """Update running statistics with new reward."""
@@ -462,11 +472,19 @@ class ExpertIterationTrainer:
         if not trajectories:
             return
 
+        # Prepend instruction matching the reward computation
+        instruction = "[INST] Predict evaluations of a hidden linear boolean formula in the form b xor a_1 x_1 xor a_2 x_2 xor ... xor x_n. [/INST]\n"
+        instr_tokens = self.tokenizer(instruction, add_special_tokens=False, return_tensors="pt").input_ids[0]
+        
         # Tokenize all trajectories
-        prompts = [format_trajectory_prompt(traj) for traj in trajectories]
+        prompts = [instruction + format_trajectory_prompt(traj) for traj in trajectories]
         batch = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
         input_ids = batch["input_ids"].to(self.device)
         attention_mask = batch["attention_mask"].to(self.device)
+        
+        # Create labels, masking the instruction part
+        labels = input_ids.clone()
+        labels[:, :len(instr_tokens)] = -100  # Mask instruction tokens
         
         # Get arrow token ID
         arrow_token = self.tokenizer.encode(" ->", add_special_tokens=False)[0]
@@ -478,15 +496,12 @@ class ExpertIterationTrainer:
         newline = self.tokenizer.encode("\n", add_special_tokens=False)[0]
         structural_tokens = {bracket_open, bracket_close, comma, arrow_token, newline}
         
-        # Create labels with shifted input_ids for autoregressive training
-        labels = input_ids.clone()
-        
         # Mask structural tokens and arrow answers
         for batch_idx in range(input_ids.size(0)):
             for pos in range(input_ids.size(1)):
                 token = input_ids[batch_idx, pos].item()
                 
-                # Mask structural tokens and arrow answers
+                # Mask structural tokens (only after instruction)
                 if token in structural_tokens:
                     labels[batch_idx, pos] = -100
                     
@@ -653,23 +668,29 @@ class ExpertIterationTrainer:
         return trajectories
 
     def batched_model_reward(self, trajectories: list[Trajectory]) -> torch.Tensor:
-        """
-        Batched reward computation for a list of trajectories.
-        For each trajectory, the full prompt is tokenized and all occurrences of the arrow token
-        (" ->") are identified. For each occurrence, the token immediately following
-        (i.e. index+1) is used to retrieve its probability from the critic model's output.
-        The correct probability (for " True" if the observation is True, or " False" otherwise)
-        is used as the reward. Returns a tensor of shape [batch_size, 2^(num_vars)],
-        where each row contains the rewards for each generation step.
-        """
-        # Construct prompts from trajectories.
-        prompts = [format_trajectory_prompt(traj) for traj in trajectories]
-        batch = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
-        batch = {k: v.to(self.device) for k, v in batch.items()}
-        with torch.no_grad():
-            outputs = self.critic_model(input_ids=batch["input_ids"],
-                                        attention_mask=batch["attention_mask"])
+        # Validate answer positions are consistent across batches
+        print("Starting batched_model_reward computation")
+        # Prepend instruction to help model understand the task
+        instruction = "[INST] Predict evaluations of a hidden linear boolean formula in the form b xor a_1 x_1 xor a_2 x_2 xor ... xor x_n. [/INST]\n"
+        prompts = [instruction + format_trajectory_prompt(traj) for traj in trajectories]
+        
+        # Tokenize all trajectories
+        batch = self.tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True
+        ).to(self.device)
+        
+        outputs = self.critic_model(**batch)
+        print(f"Model outputs shape: {outputs.logits.shape}")
         logits = outputs.logits  # shape: (B, seq_len, vocab_size)
+        
+        # Extract logits for " True" and " False" tokens
+        true_token = self.tokenizer.encode(" True", add_special_tokens=False)[0]
+        false_token = self.tokenizer.encode(" False", add_special_tokens=False)[0]
+        print(f"' True' token ID: {true_token}")  # Debug token IDs
+        print(f"' False' token ID: {false_token}")
         
         # Determine arrow token id.
         arrow_token_ids = self.tokenizer.encode(" ->", add_special_tokens=False)
@@ -680,18 +701,31 @@ class ExpertIterationTrainer:
         # Compute arrow positions using first sample (assumed consistent across batch).
         sample_tokens = batch["input_ids"][0].tolist()
         arrow_positions = [i for i, token in enumerate(sample_tokens) if token == arrow_token]
+        print(f"Found arrow positions: {arrow_positions}")
+        
+        # Verify arrow positions are consistent across all batches
+        for batch_idx in range(1, batch["input_ids"].size(0)):
+            current_tokens = batch["input_ids"][batch_idx].tolist()
+            for pos in arrow_positions:
+                if pos >= len(current_tokens):
+                    continue  # Skip if position is beyond padding
+                assert current_tokens[pos] == arrow_token, f"Batch {batch_idx} position {pos} has token {current_tokens[pos]} != arrow {arrow_token}"
+        
         # Answer positions: immediately after each arrow.
         answer_positions = [pos + 1 for pos in arrow_positions]
         B = batch["input_ids"].size(0)
         L = len(answer_positions)
         answer_positions_tensor = torch.tensor(answer_positions, device=self.device)
         
+        # Verify answer positions point to True/False tokens
+        for batch_idx in range(batch["input_ids"].size(0)):
+            current_tokens = batch["input_ids"][batch_idx].tolist()
+            for ans_pos in answer_positions:
+                if ans_pos < len(current_tokens):
+                    assert current_tokens[ans_pos] in {true_token, false_token}, f"Position {ans_pos} has invalid token {current_tokens[ans_pos]}"
+        
         # Gather logits at answer positions: shape (B, L, vocab_size)
         selected_logits = logits[:, answer_positions_tensor, :]
-        
-        # Get token ids for " True" and " False" (with leading spaces).
-        true_token = self.tokenizer.encode(" True", add_special_tokens=False)[0]
-        false_token = self.tokenizer.encode(" False", add_special_tokens=False)[0]
         
         # Instead of computing softmax over the entire vocabulary, restrict to the two tokens.
         # Gather logits for only these two tokens.
@@ -700,6 +734,10 @@ class ExpertIterationTrainer:
         max_logits, _ = torch.max(true_false_logits, dim=-1, keepdim=True)
         exp_logits = torch.exp(true_false_logits - max_logits)
         sum_exp = exp_logits.sum(dim=-1, keepdim=True)
+        # Debug: Print sample probabilities
+        sample_probs = exp_logits[0, 0, :] / sum_exp[0, 0, :]
+        print(f"Sample probabilities (True, False): {sample_probs.tolist()}")
+        
         probs = exp_logits / sum_exp  # shape: (B, L, 2)
         
         # Initialize rewards tensor.
@@ -711,6 +749,7 @@ class ExpertIterationTrainer:
             for j, obs in enumerate(traj.observations):
                 if obs:
                     rewards[i, j] = probs[i, j, 0]
+                    print(f"True case: {probs[i,j,0].item():.3f}") if i == 0 else None
                 else:
                     rewards[i, j] = probs[i, j, 1]
         return rewards
